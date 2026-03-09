@@ -7634,11 +7634,11 @@ def build_chart(symbol, df, interval_label, compact=False, max_bars=90, ext_data
     # 所有 series 也配對成同樣的字串 index，確保對齊
     vol_ma5 = vol.rolling(5).mean()
 
-    chart_h = 520 if compact else 820
+    chart_h = 520 if compact else 920
     fig = make_subplots(
-        rows=3, cols=1, shared_xaxes=True,
-        row_heights=[0.56, 0.19, 0.25], vertical_spacing=0.02,
-        subplot_titles=(f"{symbol} ({interval_label})", "成交量", "MACD"),
+        rows=4, cols=1, shared_xaxes=True,
+        row_heights=[0.50, 0.15, 0.20, 0.15], vertical_spacing=0.018,
+        subplot_titles=(f"{symbol} ({interval_label})", "成交量", "MACD", "MTF BX Signal"),
     )
     ann_size = 11 if compact else 13
     for ann in fig.layout.annotations:
@@ -7983,6 +7983,79 @@ def build_chart(symbol, df, interval_label, compact=False, max_bars=90, ext_data
 
     leg_sz = 8 if compact else 11
 
+    # ── MTF BX Signal（多時間框架突破強度直方圖）────────────────────────────
+    # 邏輯：用4個維度各打分 → 加總得出每根K的多空強度
+    # D1: 價格 vs EMA20（+1多/-1空）
+    # D2: EMA20 vs EMA60（+1多/-1空）
+    # D3: MACD hist 方向 + 動能（+2強多/+1弱多/-1弱空/-2強空）
+    # D4: 近3根K線趨勢動能（收盤連續升/降）
+    try:
+        _bx_close  = close_full.tail(MAX_BARS)
+        _bx_e20    = calc_ema(_bx_close, 20)
+        _bx_e60    = calc_ema(_bx_close, 60)
+        _bx_hist   = hist_full.tail(MAX_BARS)
+
+        _bx_scores = []
+        for _i in range(len(_bx_close)):
+            _sc = 0
+            _c  = float(_bx_close.iloc[_i])
+            _e20= float(_bx_e20.iloc[_i])
+            _e60= float(_bx_e60.iloc[_i])
+            _h  = float(_bx_hist.iloc[_i])
+
+            # D1: 價格 vs EMA20
+            _sc += 1 if _c > _e20 else -1
+            # D2: EMA20 vs EMA60
+            _sc += 1 if _e20 > _e60 else -1
+            # D3: MACD 強度
+            if _i > 0:
+                _h_prev = float(_bx_hist.iloc[_i-1])
+                if _h > 0 and _h > _h_prev:   _sc += 2   # 紅柱擴張（強多）
+                elif _h > 0:                    _sc += 1   # 紅柱收縮
+                elif _h < 0 and _h < _h_prev:  _sc -= 2   # 綠柱擴張（強空）
+                else:                            _sc -= 1
+            # D4: 近3根K線方向
+            if _i >= 2:
+                _c0 = float(_bx_close.iloc[_i])
+                _c1 = float(_bx_close.iloc[_i-1])
+                _c2 = float(_bx_close.iloc[_i-2])
+                if _c0 > _c1 > _c2:   _sc += 1
+                elif _c0 < _c1 < _c2: _sc -= 1
+
+            _bx_scores.append(_sc)
+
+        # 平滑（3根EMA）
+        import pandas as _pd2
+        _bx_s = _pd2.Series(_bx_scores)
+        _bx_smooth = _bx_s.ewm(span=3, adjust=False).mean()
+
+        # 顏色：深綠/亮綠/深紅/亮紅，4層強度
+        _bx_colors = []
+        for v in _bx_smooth:
+            if   v >= 4:   _bx_colors.append("#00ff88")    # 強多
+            elif v >= 1:   _bx_colors.append("#44bb66")    # 弱多
+            elif v >= -1:  _bx_colors.append("#886644")    # 中性偏多
+            elif v >= -4:  _bx_colors.append("#cc4444")    # 弱空
+            else:          _bx_colors.append("#ff2244")    # 強空
+
+        fig.add_trace(go.Bar(
+            x=xlabels, y=_bx_smooth,
+            marker_color=_bx_colors,
+            name="MTF BX", showlegend=True,
+            hovertemplate="MTF BX: %{y:.1f}<extra></extra>",
+        ), row=4, col=1)
+
+        # 零軸參考線
+        fig.add_hline(y=0, line_color="#334455", line_width=1, row=4, col=1)
+        # 強度閾值線
+        fig.add_hline(y=3,  line_color="#006633", line_width=0.8,
+                      line_dash="dot", row=4, col=1)
+        fig.add_hline(y=-3, line_color="#660022", line_width=0.8,
+                      line_dash="dot", row=4, col=1)
+
+    except Exception as _bx_err:
+        pass  # 靜默失敗，不影響主圖
+
     # ── x 軸刻度標籤：依週期選擇合適格式 ─────────────────────────────────
     # 日K以下用日期+時間，日K及以上只用日期
     intraday_intervals = {"1分鐘","5分鐘","15分鐘","30分鐘"}
@@ -8013,14 +8086,14 @@ def build_chart(symbol, df, interval_label, compact=False, max_bars=90, ext_data
         ),
         margin=dict(l=6, r=6, t=36 if compact else 44, b=4),
         xaxis_rangeslider_visible=False,
-        # category 類型：plotly 只顯示有數據的 bar，自動跳過休市空白
         xaxis_type="category",
         xaxis2_type="category",
         xaxis3_type="category",
+        xaxis4_type="category",
     )
 
     # 套用自訂刻度到所有 x 軸
-    for axis_name in ["xaxis", "xaxis2", "xaxis3"]:
+    for axis_name in ["xaxis", "xaxis2", "xaxis3", "xaxis4"]:
         fig.update_layout(**{
             axis_name: dict(
                 type="category",
