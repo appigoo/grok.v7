@@ -312,8 +312,19 @@ MA_CONFIGS = [(5, "#ffffff", "dash"), (15, "#ffdd66", "dot")]
 # ══════════════════════════════════════════════════════════════════════════════
 # Session State
 # ══════════════════════════════════════════════════════════════════════════════
-if "alert_log"   not in st.session_state: st.session_state.alert_log   = []
-if "sent_alerts" not in st.session_state: st.session_state.sent_alerts = set()
+if "alert_log"    not in st.session_state: st.session_state.alert_log    = []
+if "sent_alerts"  not in st.session_state: st.session_state.sent_alerts  = set()
+
+# ── 交易日誌系統 Session State ───────────────────────────────────────────────
+if "trade_log"          not in st.session_state: st.session_state.trade_log          = []
+if "calc_log"           not in st.session_state: st.session_state.calc_log           = []
+if "decision_log"       not in st.session_state: st.session_state.decision_log       = []
+if "open_trades"        not in st.session_state: st.session_state.open_trades        = {}
+if "trade_id_counter"   not in st.session_state: st.session_state.trade_id_counter   = 1
+if "psych_log"          not in st.session_state: st.session_state.psych_log          = []
+# ── 系統建議交易 Session State ──────────────────────────────────────────────
+if "trade_suggestions"  not in st.session_state: st.session_state.trade_suggestions  = []
+if "sent_suggestions"   not in st.session_state: st.session_state.sent_suggestions   = set()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 市場環境數據
@@ -361,10 +372,11 @@ def fetch_market_data() -> dict:
     return result
 
 @st.cache_data(ttl=120)
+@st.cache_data(ttl=3600)
 def fetch_vix_history() -> pd.Series:
-    """VIX 近 30 日歷史，用於趨勢判斷"""
+    """VIX 近 1 年歷史，用於趨勢判斷 & Q2百分位計算（TTL=1小時，日K不需頻繁刷新）"""
     try:
-        df = yf.download("^VIX", period="30d", interval="1d",
+        df = yf.download("^VIX", period="1y", interval="1d",
                          auto_adjust=True, progress=False)
         df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
         return df["Close"].dropna()
@@ -1418,6 +1430,790 @@ def render_social_sentiment(symbol: str):
             st.markdown("".join(parts), unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Options Flow 期權數據面板
+# 數據來源：yfinance option_chain（免費，延遲約15分鐘）
+# 指標：P/C Ratio、IV、最大痛點、到期日分佈、大額流向
+# ══════════════════════════════════════════════════════════════════════════════
+
+@st.cache_data(ttl=600)
+def fetch_options_data(symbol: str) -> dict:
+    """抓取期權數據，回傳整合分析結果（TTL=10分鐘，避免rate limit）"""
+    import time as _time
+    try:
+        t = yf.Ticker(symbol)
+
+        # Retry 最多3次，每次等待間隔遞增
+        exp_dates = None
+        for _attempt in range(3):
+            try:
+                exp_dates = t.options
+                break
+            except Exception as _e:
+                if "Too Many Requests" in str(_e) or "Rate" in str(_e):
+                    if _attempt < 2:
+                        _time.sleep(2 + _attempt * 2)
+                        t = yf.Ticker(symbol)  # 重建 Ticker
+                    else:
+                        return {"error": "rate_limit"}
+                else:
+                    return {"error": str(_e)[:80]}
+
+        if not exp_dates:
+            return {"error": "no_options"}
+
+        spot = None
+        try:
+            hist = yf.download(symbol, period="2d", interval="1d",
+                               auto_adjust=True, progress=False, multi_level_col=False)
+            if not hist.empty:
+                spot = float(hist["Close"].iloc[-1])
+        except Exception:
+            pass
+
+        # 只抓前5個到期日（減少請求數量，降低 rate limit 風險）
+        target_dates = exp_dates[:min(5, len(exp_dates))]
+        all_calls = []
+        all_puts  = []
+        by_expiry = []
+
+        for exp in target_dates:
+            try:
+                _time.sleep(0.3)   # 每次請求間隔 0.3 秒，避免觸發 rate limit
+                chain  = t.option_chain(exp)
+                calls  = chain.calls.copy()
+                puts   = chain.puts.copy()
+                calls["expiry"] = exp
+                puts["expiry"]  = exp
+                calls = calls[(calls["volume"].fillna(0) > 0) | (calls["openInterest"].fillna(0) > 0)]
+                puts  = puts[ (puts["volume"].fillna(0)  > 0) | (puts["openInterest"].fillna(0) > 0)]
+
+                c_vol  = int(calls["volume"].fillna(0).sum())
+                p_vol  = int(puts["volume"].fillna(0).sum())
+                c_oi   = int(calls["openInterest"].fillna(0).sum())
+                p_oi   = int(puts["openInterest"].fillna(0).sum())
+                c_prem = float((calls["lastPrice"].fillna(0) * calls["volume"].fillna(0)).sum())
+                p_prem = float((puts["lastPrice"].fillna(0)  * puts["volume"].fillna(0)).sum())
+
+                atm_iv_c = atm_iv_p = None
+                if spot:
+                    c_s = calls.copy(); c_s["dist"] = abs(c_s["strike"] - spot)
+                    iv_c = c_s.nsmallest(3,"dist")["impliedVolatility"].dropna()
+                    if len(iv_c) > 0: atm_iv_c = float(iv_c.mean()) * 100
+                    p_s = puts.copy(); p_s["dist"] = abs(p_s["strike"] - spot)
+                    iv_p = p_s.nsmallest(3,"dist")["impliedVolatility"].dropna()
+                    if len(iv_p) > 0: atm_iv_p = float(iv_p.mean()) * 100
+
+                by_expiry.append({
+                    "expiry":exp,"c_vol":c_vol,"p_vol":p_vol,"c_oi":c_oi,"p_oi":p_oi,
+                    "c_prem":c_prem,"p_prem":p_prem,"atm_iv_c":atm_iv_c,"atm_iv_p":atm_iv_p,
+                    "pc_vol": round(p_vol/c_vol,2) if c_vol>0 else None,
+                    "pc_oi":  round(p_oi/c_oi,2)  if c_oi>0  else None,
+                })
+                all_calls.append(calls)
+                all_puts.append(puts)
+            except Exception as _ec:
+                if "Too Many Requests" in str(_ec) or "Rate" in str(_ec):
+                    break   # rate limit 時停止繼續請求，用已抓到的數據
+                continue
+
+        if not by_expiry:
+            return {"error": "empty_chain"}
+
+        tot_c_vol  = sum(e["c_vol"]  for e in by_expiry)
+        tot_p_vol  = sum(e["p_vol"]  for e in by_expiry)
+        tot_c_oi   = sum(e["c_oi"]   for e in by_expiry)
+        tot_p_oi   = sum(e["p_oi"]   for e in by_expiry)
+        tot_c_prem = sum(e["c_prem"] for e in by_expiry)
+        tot_p_prem = sum(e["p_prem"] for e in by_expiry)
+        pc_vol_total = round(tot_p_vol/tot_c_vol,3) if tot_c_vol>0 else None
+        pc_oi_total  = round(tot_p_oi/tot_c_oi,3)  if tot_c_oi>0  else None
+
+        atm_iv_avg = None
+        if by_expiry[0]["atm_iv_c"] and by_expiry[0]["atm_iv_p"]:
+            atm_iv_avg = round((by_expiry[0]["atm_iv_c"] + by_expiry[0]["atm_iv_p"]) / 2, 1)
+
+        iv_skew = None
+        try:
+            df_c2 = pd.concat(all_calls[:2]) if all_calls else pd.DataFrame()
+            df_p2 = pd.concat(all_puts[:2])  if all_puts  else pd.DataFrame()
+            if spot and not df_c2.empty and not df_p2.empty:
+                otm_c = df_c2[df_c2["strike"] > spot*1.05]["impliedVolatility"].dropna()
+                otm_p = df_p2[df_p2["strike"] < spot*0.95]["impliedVolatility"].dropna()
+                if len(otm_c) >= 3 and len(otm_p) >= 3:
+                    iv_skew = round((float(otm_p.mean()) - float(otm_c.mean())) * 100, 1)
+        except Exception:
+            pass
+
+        max_pain = None
+        try:
+            df_cm = pd.concat(all_calls[:3]) if all_calls else pd.DataFrame()
+            df_pm = pd.concat(all_puts[:3])  if all_puts  else pd.DataFrame()
+            if not df_cm.empty and not df_pm.empty:
+                strikes = sorted(set(df_cm["strike"].tolist() + df_pm["strike"].tolist()))
+                pain_vals = []
+                for sp in strikes:
+                    cp = float(((df_cm["strike"]-sp).clip(lower=0)*df_cm["openInterest"].fillna(0)).sum())
+                    pp = float(((sp-df_pm["strike"]).clip(lower=0)*df_pm["openInterest"].fillna(0)).sum())
+                    pain_vals.append((sp, cp+pp))
+                if pain_vals:
+                    max_pain = min(pain_vals, key=lambda x: x[1])[0]
+        except Exception:
+            pass
+
+        top_trades = []
+        try:
+            all_rows = []
+            for idx in range(min(4, len(all_calls), len(all_puts))):
+                c2 = all_calls[idx].copy(); c2["type"] = "CALL"
+                p2 = all_puts[idx].copy();  p2["type"] = "PUT"
+                all_rows += [c2, p2]
+            if all_rows:
+                comb = pd.concat(all_rows)
+                comb["premium"] = comb["lastPrice"].fillna(0)*comb["volume"].fillna(0)*100
+                comb = comb[comb["premium"]>0].sort_values("premium",ascending=False)
+                for _, row in comb.head(6).iterrows():
+                    top_trades.append({
+                        "type":row["type"],"strike":float(row["strike"]),
+                        "expiry":str(row["expiry"]),
+                        "premium":float(row["premium"]),
+                        "volume":int(row["volume"]) if not pd.isna(row["volume"]) else 0,
+                        "oi":int(row["openInterest"]) if not pd.isna(row["openInterest"]) else 0,
+                        "iv":round(float(row["impliedVolatility"])*100,1) if not pd.isna(row["impliedVolatility"]) else None,
+                        "itm":bool(row.get("inTheMoney",False)),
+                    })
+        except Exception:
+            pass
+
+        signal = "neutral"
+        signal_reasons = []
+        if pc_vol_total is not None:
+            if pc_vol_total < 0.6:   signal="bull"; signal_reasons.append(f"P/C成交量={pc_vol_total:.2f}（<0.6 強烈偏多）")
+            elif pc_vol_total < 0.8: signal_reasons.append(f"P/C成交量={pc_vol_total:.2f}（偏多）")
+            elif pc_vol_total > 1.2: signal="bear"; signal_reasons.append(f"P/C成交量={pc_vol_total:.2f}（>1.2 強烈偏空）")
+            elif pc_vol_total > 1.0: signal_reasons.append(f"P/C成交量={pc_vol_total:.2f}（偏空）")
+            else:                    signal_reasons.append(f"P/C成交量={pc_vol_total:.2f}（中性）")
+        if iv_skew is not None:
+            if iv_skew>10:   signal_reasons.append(f"IV Skew=+{iv_skew:.1f}%（市場防跌保護需求高，偏空）")
+            elif iv_skew>5:  signal_reasons.append(f"IV Skew=+{iv_skew:.1f}%（輕微偏空）")
+            elif iv_skew<-5: signal_reasons.append(f"IV Skew={iv_skew:.1f}%（Call溢價>Put，偏多）")
+            else:            signal_reasons.append(f"IV Skew={iv_skew:.1f}%（均衡）")
+        if tot_c_prem>0 and tot_p_prem>0:
+            pr = tot_p_prem/tot_c_prem
+            if pr<0.7:   signal_reasons.append(f"權利金：Call ${tot_c_prem/1e6:.1f}M >> Put ${tot_p_prem/1e6:.1f}M（資金流向多頭）")
+            elif pr>1.3: signal_reasons.append(f"權利金：Put ${tot_p_prem/1e6:.1f}M >> Call ${tot_c_prem/1e6:.1f}M（資金流向空頭）")
+            else:        signal_reasons.append(f"權利金：Call ${tot_c_prem/1e6:.1f}M / Put ${tot_p_prem/1e6:.1f}M（均衡）")
+        if max_pain and spot:
+            mp_diff=(max_pain-spot)/spot*100
+            signal_reasons.append(f"最大痛點 ${max_pain:.0f}（較現價 {mp_diff:+.1f}%）")
+
+        return {
+            "spot":spot,"exp_dates":list(target_dates),"by_expiry":by_expiry,
+            "tot_c_vol":tot_c_vol,"tot_p_vol":tot_p_vol,"tot_c_oi":tot_c_oi,"tot_p_oi":tot_p_oi,
+            "tot_c_prem":tot_c_prem,"tot_p_prem":tot_p_prem,
+            "pc_vol":pc_vol_total,"pc_oi":pc_oi_total,
+            "atm_iv":atm_iv_avg,"iv_skew":iv_skew,"max_pain":max_pain,
+            "top_trades":top_trades,"signal":signal,"signal_reasons":signal_reasons,
+            "covered_dates": len(by_expiry),
+        }
+    except Exception as e:
+        err_str = str(e)
+        if "Too Many Requests" in err_str or "Rate" in err_str:
+            return {"error": "rate_limit"}
+        return {"error": err_str[:80]}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 🗺️ 多時間框架關鍵位分析（月K / 週K / 日K）
+# 邏輯：自動識別支撐/阻力 → 三框架綜合評分 → 操作建議
+# ══════════════════════════════════════════════════════════════════════════════
+
+@st.cache_data(ttl=1800)
+def fetch_mtf_keylevels(symbol: str) -> dict:
+    """
+    抓取月K/週K/日K數據，計算關鍵支撐/阻力位
+    """
+    import time as _t
+    result = {"symbol": symbol, "price": None, "frames": {}, "error": None}
+
+    frames_cfg = [
+        ("月K", "1mo", "5y",  "#cc88ff"),
+        ("週K", "1wk", "3y",  "#44aaff"),
+        ("日K", "1d",  "1y",  "#44ee88"),
+    ]
+
+    try:
+        for fname, interval, period, color in frames_cfg:
+            _t.sleep(0.3)
+            try:
+                raw = yf.download(symbol, period=period, interval=interval,
+                                  auto_adjust=True, progress=False)
+                if raw is None or raw.empty or len(raw) < 10:
+                    result["frames"][fname] = {"error": "數據不足"}
+                    continue
+
+                # 統一欄位名稱（處理 MultiIndex）
+                if isinstance(raw.columns, pd.MultiIndex):
+                    raw.columns = [c[0] for c in raw.columns]
+
+                # 確保有必要欄位
+                needed = {"Close", "High", "Low"}
+                if not needed.issubset(set(raw.columns)):
+                    result["frames"][fname] = {"error": f"缺少欄位:{raw.columns.tolist()[:4]}"}
+                    continue
+
+                close = raw["Close"].dropna()
+                high  = raw["High"].dropna()
+                low   = raw["Low"].dropna()
+
+                if len(close) < 10:
+                    result["frames"][fname] = {"error": "有效數據不足10根"}
+                    continue
+
+                price_now = float(close.iloc[-1])
+                if result["price"] is None and price_now > 0:
+                    result["price"] = price_now
+
+                # ── 關鍵位識別 ─────────────────────────────────────────────
+                levels = []
+                window = 3
+                n = len(close)
+
+                # 樞軸高點
+                for i in range(window, n - window):
+                    h = float(high.iloc[i])
+                    if all(h >= float(high.iloc[i-j]) for j in range(1, window+1)) and \
+                       all(h >= float(high.iloc[i+j]) for j in range(1, window+1)):
+                        levels.append(("阻力", h, "pivot", 1))
+
+                # 樞軸低點
+                for i in range(window, n - window):
+                    l = float(low.iloc[i])
+                    if all(l <= float(low.iloc[i-j]) for j in range(1, window+1)) and \
+                       all(l <= float(low.iloc[i+j]) for j in range(1, window+1)):
+                        levels.append(("支撐", l, "pivot", 1))
+
+                # 近期高低
+                levels.append(("阻力", float(high.iloc[-20:].max()), "近期高", 1))
+                levels.append(("支撐", float(low.iloc[-20:].min()),  "近期低", 1))
+                levels.append(("阻力", float(high.max()), "歷史高", 2))
+                levels.append(("支撐", float(low.min()),  "歷史低", 2))
+
+                # 整數關口
+                for step in [25, 50, 100, 200]:
+                    base = int(price_now / step) * step
+                    for mult in range(-4, 6):
+                        lvl = base + mult * step
+                        if 0 < lvl < price_now * 2.5:
+                            tag = "阻力" if lvl > price_now else "支撐"
+                            levels.append((tag, float(lvl), f"整{step}", 1))
+
+                # 聚類合併
+                levels.sort(key=lambda x: x[1])
+                merged = []
+                for typ, p, src, w in levels:
+                    if merged and abs(p - merged[-1][1]) / max(merged[-1][1], 0.01) < 0.015:
+                        prev = merged[-1]
+                        merged[-1] = (prev[0], (prev[1]*prev[3] + p*w)/(prev[3]+w),
+                                      prev[2], prev[3]+w)
+                    else:
+                        merged.append((typ, p, src, w))
+
+                # 篩選上下各6個
+                resistances = sorted(
+                    [(round(p,2), src, round(w,1))
+                     for t,p,src,w in merged if p > price_now * 1.003],
+                    key=lambda x: x[0])[:6]
+
+                supports = sorted(
+                    [(round(p,2), src, round(w,1))
+                     for t,p,src,w in merged if p < price_now * 0.997],
+                    key=lambda x: -x[0])[:6]
+
+                # 方向判斷
+                ema20 = close.ewm(span=min(20,n//2), adjust=False).mean()
+                ema60 = close.ewm(span=min(60,n//2), adjust=False).mean()
+                e20   = float(ema20.iloc[-1])
+                e60   = float(ema60.iloc[-1])
+                e20p  = float(ema20.iloc[-5]) if n >= 5 else e20
+
+                if price_now > e20 and price_now > e60 and e20 > e20p:
+                    direction, dir_label, dir_color = "bull", "多頭", "#00ee66"
+                elif price_now < e20 and price_now < e60 and e20 < e20p:
+                    direction, dir_label, dir_color = "bear", "空頭", "#ff5566"
+                elif price_now > e20 and e20 <= e20p:
+                    direction, dir_label, dir_color = "neutral_bear", "偏空震盪", "#ff8844"
+                elif price_now < e20 and e20 >= e20p:
+                    direction, dir_label, dir_color = "neutral_bull", "偏多震盪", "#88ee44"
+                else:
+                    direction, dir_label, dir_color = "neutral", "中性", "#ffcc44"
+
+                chg_pct = float((close.iloc[-1]-close.iloc[-2])/close.iloc[-2]*100) if n>=2 else 0
+
+                nr = resistances[0][0] if resistances else None
+                ns = supports[0][0]    if supports    else None
+
+                result["frames"][fname] = {
+                    "color": color, "price": price_now,
+                    "direction": direction, "dir_label": dir_label, "dir_color": dir_color,
+                    "chg_pct": round(chg_pct, 2),
+                    "ema20": round(e20, 2), "ema60": round(e60, 2),
+                    "resistances": resistances, "supports": supports,
+                    "nearest_res": nr, "nearest_sup": ns,
+                    "dist_res_pct": round((nr-price_now)/price_now*100,1) if nr else None,
+                    "dist_sup_pct": round((price_now-ns)/price_now*100,1) if ns else None,
+                    "bars": n,
+                }
+
+            except Exception as _fe:
+                result["frames"][fname] = {"error": str(_fe)[:80]}
+
+        return result
+
+    except Exception as e:
+        result["error"] = str(e)[:80]
+        return result
+
+
+def render_mtf_keylevel_analysis(symbol: str, current_price: float = None):
+    """多時間框架關鍵位分析面板"""
+    st.markdown(
+        '<div style="display:flex;align-items:center;gap:10px;margin-bottom:4px;">'
+        '<div style="font-size:1.1rem;font-weight:900;color:#e0e8ff;font-family:monospace;">'
+        '🗺️ 多框架關鍵位分析</div>'
+        '<div style="font-size:0.7rem;color:#445566;border:1px solid #223344;border-radius:10px;'
+        'padding:1px 8px;">月K · 週K · 日K 三框架綜合</div>'
+        '</div>',
+        unsafe_allow_html=True)
+
+    with st.spinner(f"計算 {symbol} 關鍵支撐阻力位..."):
+        data = fetch_mtf_keylevels(symbol)
+
+    if data.get("error"):
+        st.error(f"載入失敗：{data['error']}")
+        return
+
+    # price：優先用快取數據，fallback 用 render_single 傳入的即時價格
+    price = float(data.get("price") or 0)
+    if price <= 0 and current_price and current_price > 0:
+        price = float(current_price)
+    if price <= 0:
+        st.warning("⚠️ 無法取得當前價格，請稍後重試")
+        return
+
+    frames = data.get("frames", {})
+    frame_order = ["月K", "週K", "日K"]
+
+    # ── 三框架方向評分 ──────────────────────────────────────────────────────
+    dir_scores = {"bull": 2, "neutral_bull": 1, "neutral": 0, "neutral_bear": -1, "bear": -2}
+    total_score = 0
+    valid_frames = 0
+    for fn in frame_order:
+        fd = frames.get(fn, {})
+        if "error" not in fd:
+            total_score += dir_scores.get(fd.get("direction", "neutral"), 0)
+            valid_frames += 1
+
+    if valid_frames > 0:
+        avg_score = total_score / valid_frames
+        if avg_score >= 1.5:
+            overall = "🟢 三框架一致多頭"; ov_color = "#00ee66"; ov_action = "可積極做多"
+        elif avg_score >= 0.5:
+            overall = "🟡 偏多（有分歧）";  ov_color = "#aaee44"; ov_action = "輕倉偏多，等信號確認"
+        elif avg_score >= -0.5:
+            overall = "⚪ 多空分歧震盪";   ov_color = "#ffcc44"; ov_action = "觀望為主，等突破方向"
+        elif avg_score >= -1.5:
+            overall = "🟠 偏空（有分歧）";  ov_color = "#ff8844"; ov_action = "輕倉偏空，設好止損"
+        else:
+            overall = "🔴 三框架一致空頭"; ov_color = "#ff5566"; ov_action = "可積極做空"
+    else:
+        overall = "⚪ 數據不足"; ov_color = "#778899"; ov_action = "暫無建議"
+
+    # ── 找跨框架確認的關鍵位（月K+週K+日K都有的相近水平）────────────────────
+    def _collect_levels(frames, frame_order):
+        all_res, all_sup = [], []
+        for fn in frame_order:
+            fd = frames.get(fn, {})
+            if "error" in fd: continue
+            for p, s, n in fd.get("resistances", []):
+                all_res.append((p, fn))
+            for p, s, n in fd.get("supports", []):
+                all_sup.append((p, fn))
+        return all_res, all_sup
+
+    all_res, all_sup = _collect_levels(frames, frame_order)
+
+    def _find_confluences(levels, threshold=0.025):
+        if not levels: return []
+        levels_s = sorted(levels, key=lambda x: x[0])
+        groups = []
+        cur_group = [levels_s[0]]
+        for item in levels_s[1:]:
+            if abs(item[0] - cur_group[0][0]) / max(cur_group[0][0], 0.01) <= threshold:
+                cur_group.append(item)
+            else:
+                groups.append(cur_group)
+                cur_group = [item]
+        groups.append(cur_group)
+        result = []
+        for g in groups:
+            avg_price = sum(x[0] for x in g) / len(g)
+            frames_hit = list(set(x[1] for x in g))
+            result.append((round(avg_price, 2), frames_hit, len(g)))
+        return sorted(result, key=lambda x: -len(x[1]))
+
+    conf_res = _find_confluences([(p, fn) for p, fn in all_res if p > price])
+    conf_sup = _find_confluences([(p, fn) for p, fn in all_sup if p < price])
+
+    # ── 操作建議生成 ────────────────────────────────────────────────────────
+    def _make_suggestion(price, conf_res, conf_sup, avg_score, frames):
+        day  = frames.get("日K", {})
+        week = frames.get("週K", {})
+
+        # price 防護
+        safe_price = float(price) if (price and float(price) > 0) else 100.0
+
+        nearest_res = conf_res[0][0] if conf_res else (day.get("nearest_res") or None)
+        nearest_sup = conf_sup[0][0] if conf_sup else (day.get("nearest_sup") or None)
+
+        if nearest_res is None: nearest_res = round(safe_price * 1.05, 2)
+        if nearest_sup is None: nearest_sup = round(safe_price * 0.95, 2)
+
+        # 多頭劇本
+        if avg_score >= 0.5:
+            entry   = round(safe_price, 2)
+            sl      = round(nearest_sup * 0.99, 2)
+            tp1     = round(nearest_res, 2)
+            tp2     = round(nearest_res * 1.03, 2) if len(conf_res) > 1 else round(nearest_res * 1.05, 2)
+            sl_pct  = round((entry - sl) / entry * 100, 1)
+            tp1_pct = round((tp1 - entry) / entry * 100, 1)
+            rr1     = round(abs(tp1 - entry) / max(abs(entry - sl), 0.01), 1)
+            return {
+                "dir": "LONG", "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2,
+                "sl_pct": sl_pct, "tp1_pct": tp1_pct, "rr1": rr1,
+                "cond": f"守住支撐 ${nearest_sup:.2f}，等待量能確認後進多",
+                "break_cond": f"若日K收盤跌破 ${nearest_sup:.2f} → 止損出場",
+            }
+        # 空頭劇本
+        elif avg_score <= -0.5:
+            entry   = round(safe_price, 2)
+            sl      = round(nearest_res * 1.01, 2)
+            tp1     = round(nearest_sup, 2)
+            tp2     = round(nearest_sup * 0.97, 2) if len(conf_sup) > 1 else round(nearest_sup * 0.95, 2)
+            sl_pct  = round((sl - entry) / entry * 100, 1)
+            tp1_pct = round((entry - tp1) / entry * 100, 1)
+            rr1     = round(abs(entry - tp1) / max(abs(sl - entry), 0.01), 1)
+            return {
+                "dir": "SHORT", "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2,
+                "sl_pct": sl_pct, "tp1_pct": tp1_pct, "rr1": rr1,
+                "cond": f"阻力 ${nearest_res:.2f} 壓制未突破，等回調後進空",
+                "break_cond": f"若日K收盤站上 ${nearest_res:.2f} → 止損出場",
+            }
+        else:
+            return {
+                "dir": "WAIT", "entry": safe_price, "sl": None, "tp1": None, "tp2": None,
+                "sl_pct": 0, "tp1_pct": 0, "rr1": 0,
+                "cond": f"多空分歧，等待突破 ${nearest_res:.2f} 或跌破 ${nearest_sup:.2f} 再入場",
+                "break_cond": f"突破 ${nearest_res:.2f} → 做多；跌破 ${nearest_sup:.2f} → 做空",
+            }
+
+    sug = _make_suggestion(price, conf_res, conf_sup, avg_score if valid_frames > 0 else 0, frames)
+
+    # ════════════════════ 渲染開始 ════════════════════════════════════════════
+
+    # ── 頂部：整體方向 + 當前價 ────────────────────────────────────────────
+    st.markdown(
+        f'<div style="background:#07090f;border:1px solid {ov_color}44;border-radius:14px;'
+        f'padding:16px 20px;margin-bottom:12px;">'
+        f'<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">'
+        f'<div>'
+        f'<div style="font-size:1.15rem;font-weight:800;color:{ov_color};">{overall}</div>'
+        f'<div style="font-size:0.78rem;color:#778899;margin-top:3px;">💡 {ov_action}</div>'
+        f'</div>'
+        f'<div style="text-align:right;">'
+        f'<div style="font-size:1.6rem;font-weight:900;color:#eef;font-family:monospace;">${price:.2f}</div>'
+        f'<div style="font-size:0.72rem;color:#445566;">{symbol} 當前價</div>'
+        f'</div></div>'
+        f'</div>',
+        unsafe_allow_html=True)
+
+    # ── 三框架並排 ─────────────────────────────────────────────────────────
+    cols = st.columns(3)
+    for ci, fname in enumerate(frame_order):
+        fd = frames.get(fname, {})
+        with cols[ci]:
+            if "error" in fd:
+                st.markdown(
+                    f'<div style="background:#0c1220;border-radius:10px;padding:12px;'
+                    f'color:#445566;font-size:0.78rem;">⚠️ {fname}<br>{fd["error"]}</div>',
+                    unsafe_allow_html=True)
+                continue
+
+            fc    = fd["color"]
+            dlbl  = fd["dir_label"]
+            dcol  = fd["dir_color"]
+            nr    = fd.get("nearest_res")
+            ns    = fd.get("nearest_sup")
+            dr    = fd.get("dist_res_pct")
+            ds    = fd.get("dist_sup_pct")
+            chg   = fd.get("chg_pct", 0)
+            chg_c = "#00ee66" if chg >= 0 else "#ff5566"
+
+            # 支撐/阻力列表
+            res_html = ""
+            for i, (rp, rs, rn) in enumerate(fd["resistances"][:4]):
+                is_nearest = (i == 0)
+                weight = "font-weight:700;" if is_nearest else ""
+                bg = "background:#1a0a28;" if is_nearest else ""
+                res_html += (f'<div style="{bg}border-radius:3px;padding:2px 6px;'
+                             f'display:flex;justify-content:space-between;">'
+                             f'<span style="color:#cc88ff;{weight}">${rp:.2f}</span>'
+                             f'<span style="color:#445566;font-size:0.65rem;">{rn}×</span></div>')
+
+            sup_html = ""
+            for i, (sp, ss, sn) in enumerate(fd["supports"][:4]):
+                is_nearest = (i == 0)
+                weight = "font-weight:700;" if is_nearest else ""
+                bg = "background:#0a1a28;" if is_nearest else ""
+                sup_html += (f'<div style="{bg}border-radius:3px;padding:2px 6px;'
+                             f'display:flex;justify-content:space-between;">'
+                             f'<span style="color:#44aaff;{weight}">${sp:.2f}</span>'
+                             f'<span style="color:#445566;font-size:0.65rem;">{sn}×</span></div>')
+
+            card = (
+                f'<div style="background:#0c1220;border:1px solid {fc}44;'
+                f'border-top:3px solid {fc};border-radius:10px;padding:12px 14px;">'
+
+                # 標題行
+                f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">'
+                f'<span style="color:{fc};font-weight:800;font-size:0.9rem;">{fname}</span>'
+                f'<span style="background:{dcol}22;color:{dcol};border-radius:10px;'
+                f'padding:1px 8px;font-size:0.72rem;">{dlbl}</span>'
+                f'</div>'
+
+                # 當根漲跌 + EMA
+                f'<div style="font-size:0.72rem;color:{chg_c};margin-bottom:6px;">'
+                f'本根 {chg:+.2f}%　EMA20:{fd["ema20"]:.2f}</div>'
+
+                # 阻力
+                f'<div style="font-size:0.7rem;color:#886699;font-weight:600;'
+                f'margin-bottom:3px;margin-top:4px;">▲ 阻力'
+                + (f'　<span style="color:#668866;font-size:0.65rem;">最近+{dr:.1f}%</span>' if dr else '')
+                + f'</div>'
+                + res_html
+
+                # 當前價指示條
+                + f'<div style="background:#44aaff;border-radius:2px;height:2px;margin:6px 0;opacity:0.5;"></div>'
+                f'<div style="text-align:center;font-size:0.72rem;color:#aabbcc;'
+                f'font-weight:700;margin:-2px 0 4px;">📍 ${price:.2f}</div>'
+
+                # 支撐
+                + f'<div style="font-size:0.7rem;color:#446699;font-weight:600;margin-bottom:3px;">▼ 支撐'
+                + (f'　<span style="color:#668866;font-size:0.65rem;">最近-{ds:.1f}%</span>' if ds else '')
+                + f'</div>'
+                + sup_html
+                + f'</div>'
+            )
+            st.markdown(card, unsafe_allow_html=True)
+
+    # ── 多框架共振關鍵位 ────────────────────────────────────────────────────
+    if conf_res or conf_sup:
+        st.markdown(
+            '<div style="font-size:0.8rem;font-weight:700;color:#ffcc44;'
+            'margin:14px 0 6px;">⚡ 多框架共振關鍵位（越多框架確認越強）</div>',
+            unsafe_allow_html=True)
+
+        lvl_html = '<div style="display:flex;flex-wrap:wrap;gap:8px;">'
+
+        for p, fnames, n in conf_res[:5]:
+            strength = len(fnames)
+            sc = "#ff44aa" if strength >= 3 else "#cc88ff" if strength == 2 else "#886699"
+            tag = "🔴🔴🔴" if strength >= 3 else "🔴🔴" if strength == 2 else "🔴"
+            dist = round((p - price) / price * 100, 1)
+            lvl_html += (
+                f'<div style="background:#1a0a20;border:1px solid {sc}55;border-radius:8px;'
+                f'padding:6px 12px;min-width:120px;">'
+                f'<div style="color:{sc};font-weight:700;">{tag} ${p:.2f}</div>'
+                f'<div style="color:#556677;font-size:0.68rem;">'
+                f'{"+".join(fnames)}　+{dist:.1f}%</div></div>')
+
+        for p, fnames, n in conf_sup[:5]:
+            strength = len(fnames)
+            sc = "#44ff88" if strength >= 3 else "#44aaff" if strength == 2 else "#446688"
+            tag = "🟢🟢🟢" if strength >= 3 else "🟢🟢" if strength == 2 else "🟢"
+            dist = round((price - p) / price * 100, 1)
+            lvl_html += (
+                f'<div style="background:#0a1a10;border:1px solid {sc}55;border-radius:8px;'
+                f'padding:6px 12px;min-width:120px;">'
+                f'<div style="color:{sc};font-weight:700;">{tag} ${p:.2f}</div>'
+                f'<div style="color:#556677;font-size:0.68rem;">'
+                f'{"+".join(fnames)}　-{dist:.1f}%</div></div>')
+
+        lvl_html += '</div>'
+        st.markdown(lvl_html, unsafe_allow_html=True)
+
+    # ── 操作建議 ────────────────────────────────────────────────────────────
+    st.markdown('<div style="height:10px;"></div>', unsafe_allow_html=True)
+    dir_c  = {"LONG": "#00ee66", "SHORT": "#ff5566", "WAIT": "#ffcc44"}[sug["dir"]]
+    dir_ic = {"LONG": "▲ 做多",  "SHORT": "▼ 做空",  "WAIT": "⟺ 觀望"}[sug["dir"]]
+
+    sug_html = (
+        f'<div style="background:#07090f;border:1px solid {dir_c}44;'
+        f'border-left:4px solid {dir_c};border-radius:12px;padding:16px 20px;">'
+        f'<div style="font-size:0.72rem;color:#445566;margin-bottom:8px;letter-spacing:1px;">'
+        f'📋 三框架綜合操作建議</div>'
+        f'<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px;">'
+        f'<span style="background:{dir_c}22;color:{dir_c};border:1px solid {dir_c}55;'
+        f'border-radius:20px;padding:3px 14px;font-weight:800;font-size:0.95rem;">{dir_ic}</span>'
+        f'<span style="color:#778899;font-size:0.78rem;">{sug["cond"]}</span>'
+        f'</div>'
+    )
+
+    if sug["dir"] != "WAIT" and sug["sl"]:
+        sug_html += (
+            f'<div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:10px;">'
+            f'<div><span style="color:#445577;font-size:0.72rem;">進場</span> '
+            f'<span style="color:#44aaff;font-weight:700;font-size:1.0rem;">${sug["entry"]:.2f}</span></div>'
+            f'<div><span style="color:#445577;font-size:0.72rem;">止損</span> '
+            f'<span style="color:#ff4444;font-weight:700;">${sug["sl"]:.2f}</span>'
+            f'<span style="color:#663333;font-size:0.7rem;"> (-{sug["sl_pct"]:.1f}%)</span></div>'
+            f'<div><span style="color:#445577;font-size:0.72rem;">止盈①</span> '
+            f'<span style="color:#44ee66;font-weight:700;">${sug["tp1"]:.2f}</span>'
+            f'<span style="color:#336633;font-size:0.7rem;"> (+{sug["tp1_pct"]:.1f}% R:{sug["rr1"]:.1f})</span></div>'
+            f'<div><span style="color:#445577;font-size:0.72rem;">止盈②</span> '
+            f'<span style="color:#aaffcc;font-weight:600;">${sug["tp2"]:.2f}</span></div>'
+            f'</div>'
+        )
+
+    sug_html += (
+        f'<div style="background:#0c1220;border-radius:6px;padding:8px 12px;'
+        f'font-size:0.73rem;color:#ffaa44;">'
+        f'⚠️ 出場條件：{sug["break_cond"]}</div>'
+        f'<div style="font-size:0.65rem;color:#334455;margin-top:8px;">'
+        f'* 關鍵位基於60日月K/週K/日K樞軸點自動計算｜僅供技術參考，不構成投資建議</div>'
+        f'</div>'
+    )
+    st.markdown(sug_html, unsafe_allow_html=True)
+
+    # 重新計算按鈕
+    if st.button(f"🔄 重新計算關鍵位 ({symbol})", key=f"recalc_mtf_{symbol}"):
+        fetch_mtf_keylevels.clear()
+        st.rerun()
+
+
+def render_options_panel(symbol: str):
+    """期權數據面板 — P/C Ratio、IV、最大痛點、流向、到期日分佈"""
+    with st.spinner(f"載入 {symbol} 期權數據（最多約5秒）..."):
+        data = fetch_options_data(symbol)
+
+    if "error" in data:
+        err = data["error"]
+        if err == "rate_limit":
+            st.markdown(
+                '<div style="background:#1a2030;border:1px solid #445;border-radius:8px;padding:16px;">'
+                '<div style="color:#ffaa44;font-size:0.9rem;font-weight:600;margin-bottom:6px;">⏳ Yahoo Finance 請求過於頻繁</div>'
+                '<div style="color:#8899aa;font-size:0.8rem;">yfinance 免費 API 有速率限制，期權數據已快取10分鐘。</div>'
+                '<div style="color:#8899aa;font-size:0.8rem;margin-top:4px;">請等待 <b style="color:#ffcc44;">1-2 分鐘</b> 後點擊「強制刷新數據快取」再試，或繼續使用其他面板。</div>'
+                '</div>',
+                unsafe_allow_html=True)
+            if st.button(f"🔄 清除期權快取並重試 ({symbol})", key=f"opt_retry_{symbol}"):
+                fetch_options_data.clear()
+                st.rerun()
+        else:
+            msg = {
+                "no_options": "此股票無期權市場（通常為小型股）",
+                "empty_chain": "期權鏈數據為空，請稍後再試",
+            }.get(err, f"載入失敗：{err}")
+            st.markdown(
+                f'<div style="background:#1a2535;border:1px solid #334;border-radius:8px;'
+                f'padding:16px;color:#667788;font-size:0.85rem;">🔒 {msg}</div>',
+                unsafe_allow_html=True)
+        return
+
+    spot=data.get("spot"); pc_vol=data.get("pc_vol"); pc_oi=data.get("pc_oi")
+    atm_iv=data.get("atm_iv"); iv_skew=data.get("iv_skew"); max_pain=data.get("max_pain")
+    signal=data.get("signal","neutral"); reasons=data.get("signal_reasons",[])
+    sig_color={"bull":"#00ee66","bear":"#ff4444","neutral":"#aabb88"}[signal]
+    sig_icon={"bull":"🐂","bear":"🐻","neutral":"⚖️"}[signal]
+    sig_label={"bull":"偏多","bear":"偏空","neutral":"中性"}[signal]
+
+    def _mc(col,title,value,sub="",color="#ccd6ee",warn=""):
+        with col:
+            st.markdown(
+                f'<div style="background:#111e2e;border:1px solid #223344;border-radius:8px;padding:12px 10px;text-align:center;">' +
+                f'<div style="font-size:0.72rem;color:#5577aa;margin-bottom:4px;">{title}</div>' +
+                f'<div style="font-size:1.3rem;font-weight:700;color:{color};">{value}</div>' +
+                f'<div style="font-size:0.7rem;color:#6688aa;margin-top:2px;">{sub}</div>' +
+                (f'<div style="font-size:0.68rem;color:#ffaa44;margin-top:3px;">{warn}</div>' if warn else "") +
+                '</div>', unsafe_allow_html=True)
+
+    c1,c2,c3,c4,c5 = st.columns(5)
+    if pc_vol is not None:
+        pc_c="#00ee66" if pc_vol<0.8 else ("#ff4444" if pc_vol>1.2 else "#ffcc44")
+        _mc(c1,"P/C 成交量比",f"{pc_vol:.2f}",f"C:{data['tot_c_vol']//1000}K P:{data['tot_p_vol']//1000}K",pc_c,"偏多" if pc_vol<0.8 else ("偏空" if pc_vol>1.2 else "中性"))
+    else: _mc(c1,"P/C 成交量比","N/A","","#445566")
+    if pc_oi is not None:
+        oi_c="#00ee66" if pc_oi<0.8 else ("#ff4444" if pc_oi>1.2 else "#ffcc44")
+        _mc(c2,"P/C 未平倉比",f"{pc_oi:.2f}",f"C:{data['tot_c_oi']//1000}K P:{data['tot_p_oi']//1000}K",oi_c)
+    else: _mc(c2,"P/C 未平倉比","N/A","","#445566")
+    if atm_iv is not None:
+        iv_c="#ff6644" if atm_iv>80 else ("#ffaa44" if atm_iv>60 else ("#ffcc44" if atm_iv>40 else "#00cc99"))
+        _mc(c3,"ATM IV（近月）",f"{atm_iv:.1f}%","隱含波動率",iv_c,"極高恐慌" if atm_iv>80 else ("高波動" if atm_iv>60 else ("偏高" if atm_iv>40 else "正常")))
+    else: _mc(c3,"ATM IV（近月）","N/A","","#445566")
+    if iv_skew is not None:
+        sk_c="#ff4444" if iv_skew>8 else ("#ffcc44" if iv_skew>3 else ("#00ee66" if iv_skew<-3 else "#aabbcc"))
+        _mc(c4,"IV Skew（Put-Call）",f"{iv_skew:+.1f}%","OTM Put-Call IV",sk_c,"防護需求↑" if iv_skew>5 else ("Call溢價↑" if iv_skew<-5 else "均衡"))
+    else: _mc(c4,"IV Skew","N/A","","#445566")
+    if max_pain is not None and spot:
+        mp_d=(max_pain-spot)/spot*100
+        _mc(c5,"最大痛點",f"${max_pain:.0f}",f"現價${spot:.0f}（{mp_d:+.1f}%）","#aaffcc" if abs(mp_d)<3 else ("#ffaa44" if abs(mp_d)<8 else "#ff6644"))
+    else: _mc(c5,"最大痛點","N/A","","#445566")
+
+    st.markdown("<div style='height:10px'></div>",unsafe_allow_html=True)
+    col_s,col_e = st.columns([1,1])
+
+    with col_s:
+        rh="".join(f'<div style="padding:3px 0;border-bottom:1px solid #1e2e3e;font-size:0.78rem;color:#99aacc;">• {r}</div>' for r in reasons)
+        st.markdown(
+            f'<div style="background:#0e1e2e;border:1px solid {sig_color}44;border-radius:8px;padding:14px;">' +
+            f'<div style="font-size:0.85rem;font-weight:700;color:{sig_color};margin-bottom:8px;">{sig_icon} 期權流向信號：{sig_label}</div>' +
+            rh + '<div style="font-size:0.68rem;color:#446;margin-top:8px;">⚠️ 期權為附加信號，需配合技術面確認。高P/C可能是對沖而非純空頭。</div></div>',
+            unsafe_allow_html=True)
+
+    with col_e:
+        by_exp=data.get("by_expiry",[])
+        if by_exp:
+            rows=[]
+            for e in by_exp[:6]:
+                pc=f"{e['pc_vol']:.2f}" if e["pc_vol"] else "—"
+                pc_c="#00ee66" if (e["pc_vol"] and e["pc_vol"]<0.8) else ("#ff4444" if (e["pc_vol"] and e["pc_vol"]>1.2) else "#ffcc44")
+                iv_s=f"{e['atm_iv_c']:.0f}%" if e["atm_iv_c"] else "—"
+                rows.append(f'<tr><td style="color:#aabbcc;padding:3px 6px;">{e["expiry"][5:]}</td><td style="color:#66aaff;text-align:right;padding:3px 6px;">{e["c_vol"]:,}</td><td style="color:#ff6666;text-align:right;padding:3px 6px;">{e["p_vol"]:,}</td><td style="color:{pc_c};text-align:right;padding:3px 6px;">{pc}</td><td style="color:#aacc88;text-align:right;padding:3px 6px;">{iv_s}</td></tr>')
+            st.markdown(
+                '<div style="background:#0e1e2e;border:1px solid #223;border-radius:8px;padding:12px;">' +
+                '<div style="font-size:0.8rem;font-weight:700;color:#7799cc;margin-bottom:8px;">📅 各到期日期權分佈</div>' +
+                '<table style="width:100%;border-collapse:collapse;font-size:0.75rem;">' +
+                '<tr style="color:#556677;border-bottom:1px solid #223;"><th style="text-align:left;padding:3px 6px;">到期日</th><th style="text-align:right;padding:3px 6px;">Call量</th><th style="text-align:right;padding:3px 6px;">Put量</th><th style="text-align:right;padding:3px 6px;">P/C</th><th style="text-align:right;padding:3px 6px;">ATM IV</th></tr>' +
+                "".join(rows) + '</table></div>', unsafe_allow_html=True)
+
+    top=data.get("top_trades",[])
+    if top:
+        st.markdown('<div style="font-size:0.8rem;font-weight:700;color:#7799cc;margin:10px 0 4px;">💰 大額期權流向（依保費規模排序）</div>',unsafe_allow_html=True)
+        cards=[]
+        for tr in top:
+            ic=tr["type"]=="CALL"
+            bg="#0d2010" if ic else "#200d0d"; bd="#00aa44" if ic else "#aa2222"
+            ti="📈 CALL" if ic else "📉 PUT"
+            itm='<span style="background:#335;color:#aaf;font-size:0.65rem;padding:1px 4px;border-radius:3px;margin-left:4px;">ITM</span>' if tr["itm"] else ""
+            pm=tr["premium"]/1e6; ps=f"${pm:.2f}M" if pm>=0.1 else f"${tr['premium']/1e3:.0f}K"
+            iv_s=f"IV {tr['iv']:.0f}%" if tr["iv"] else ""
+            cards.append(f'<div style="background:{bg};border:1px solid {bd}44;border-radius:6px;padding:10px 12px;flex:1;min-width:140px;"><div style="font-size:0.8rem;font-weight:700;color:{"#00cc55" if ic else "#ee3333"};">{ti}{itm}</div><div style="font-size:1.0rem;font-weight:700;color:#eef;margin:4px 0;">Strike ${tr["strike"]:.0f}</div><div style="font-size:0.72rem;color:#8899aa;">{tr["expiry"][5:]}</div><div style="font-size:0.78rem;color:#ffcc44;font-weight:600;margin-top:4px;">{ps}</div><div style="font-size:0.7rem;color:#667788;">Vol {tr["volume"]:,} · OI {tr["oi"]:,} · {iv_s}</div></div>')
+        for row in [cards[:3],cards[3:6]]:
+            if row: st.markdown(f'<div style="display:flex;gap:8px;margin-bottom:6px;">'+"".join(row)+"</div>",unsafe_allow_html=True)
+
+    st.markdown('<div style="font-size:0.68rem;color:#334455;margin-top:8px;">數據來源：Yahoo Finance Options（約15分鐘延遲）｜高P/C可能包含機構對沖部位</div>',unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # AI 技術分析模組
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1842,14 +2638,1384 @@ def add_alert(symbol: str, period: str, msg: str, atype: str = "info"):
     now = datetime.now().strftime("%H:%M:%S")
     key = f"{symbol}|{period}|{msg}"
     if key not in st.session_state.sent_alerts:
+        # ── 衝突偵測：同一 symbol+period 內是否已有反向訊號 ──────────────────
+        conflict_note = ""
+        recent_same = [
+            a for a in st.session_state.alert_log[:10]
+            if a["股票"] == symbol and a["週期"] == period
+        ]
+        if recent_same:
+            opposite = {"bull": "bear", "bear": "bull"}
+            has_opposite = any(a["類型"] == opposite.get(atype) for a in recent_same)
+            if has_opposite:
+                if atype == "bull":
+                    conflict_note = "　⚡【多空分歧】同時存在空頭訊號，短多但中線謹慎，勿重倉！"
+                elif atype == "bear":
+                    conflict_note = "　⚡【多空分歧】同時存在多頭訊號，注意支撐，空單設好止損！"
+        final_msg = msg + conflict_note
         st.session_state.alert_log.insert(0,
-            {"時間": now, "股票": symbol, "週期": period, "訊息": msg, "類型": atype})
+            {"時間": now, "股票": symbol, "週期": period, "訊息": final_msg, "類型": atype})
         st.session_state.alert_log = st.session_state.alert_log[:200]
         st.session_state.sent_alerts.add(key)
-        send_telegram(f"📊 [{symbol} {period}] {msg}")
+        send_telegram(f"📊 [{symbol} {period}] {final_msg}")
+
+
+# ── 高置信信號 → 自動生成模擬建議交易 ──────────────────────────────────────
+# 觸發條件：10年回測 WR ≥ 95% 的信號（F6/F7/F8/F9/P6）
+# 以及組合信號達到足夠置信度時
+
+# 信號→建議對照表（key片段, direction, wr, n, atr_sl_mult, atr_tp_mult）
+_HIGH_CONF_SIGNALS = {
+    # key片段           方向      WR      n     SL倍  TP1倍  TP2倍  說明
+    "F6-衰竭跳空上":   ("SHORT", 100.0, 157,  1.5,  2.0,  3.5,  "衰竭跳空(上)｜10年WR=100%收低"),
+    "F7-衰竭跳空下":   ("LONG",  100.0, 150,  1.5,  2.0,  3.5,  "衰竭跳空(下)反彈｜10年WR=100%收高"),
+    "F8-持續跳空上":   ("LONG",  100.0,  90,  1.5,  2.0,  3.5,  "持續跳空(上)｜10年WR=100%收高"),
+    "F9-持續跳空下":   ("SHORT",  99.0, 105,  1.5,  2.0,  3.0,  "持續跳空(下)｜10年WR=99%收低"),
+    "P6-跳空量能強化":  ("LONG",  100.0,  38,  1.2,  1.8,  3.0,  "突破跳空量能強化｜10年WR=100%"),
+    "F0-超級跳空":      ("LONG",   85.0,  20,  2.0,  2.5,  4.0,  "超級跳空缺口｜強烈趨勢啟動"),
+    # 突破跳空(下) - 從信號文字判斷
+    "突破跳空(下)":    ("SHORT", 100.0,  46,  1.5,  2.0,  3.5,  "突破跳空(下)｜10年WR=100%收低"),
+    "突破跳空(上)":    ("LONG",  100.0,  57,  1.5,  2.0,  3.5,  "突破跳空(上)｜10年WR=100%收高"),
+}
+
+def generate_trade_suggestion(symbol: str, period: str, signal_msg: str,
+                               atype: str, price: float, atr: float):
+    """
+    根據高置信信號自動生成模擬建議交易。
+    只針對 WR≥95% 的信號，計算進場/止損/止盈。
+    """
+    if not price or not atr or atr <= 0:
+        return
+
+    # 比對高置信信號
+    matched = None
+    for key_frag, params in _HIGH_CONF_SIGNALS.items():
+        if key_frag in signal_msg:
+            matched = params
+            break
+
+    # 若未命中高置信信號，判斷組合信號（bull/bear 且訊息含多個高WR特徵）
+    if not matched:
+        # 組合信號：至少含2個以下關鍵詞才觸發（置信度較低，WR約65-75%）
+        bull_keys = ["MACD金叉", "EMA金叉", "底部反彈", "均線聚合突破", "OBV突破", "EMA壓縮爆發"]
+        bear_keys = ["MACD死叉", "EMA死叉", "空頭排列", "衰竭", "頂背離", "均線壓制"]
+        if atype == "bull":
+            hits = sum(1 for k in bull_keys if k in signal_msg)
+            if hits >= 1:
+                matched = ("LONG", 65.0, 50, 1.2, 1.5, 2.5, f"組合多頭信號（{hits}項確認）")
+        elif atype == "bear":
+            hits = sum(1 for k in bear_keys if k in signal_msg)
+            if hits >= 1:
+                matched = ("SHORT", 65.0, 50, 1.2, 1.5, 2.5, f"組合空頭信號（{hits}項確認）")
+
+    if not matched:
+        return
+
+    direction, wr, n_samples, sl_mult, tp1_mult, tp2_mult, desc = matched
+
+    # 計算進場/止損/止盈
+    if direction == "LONG":
+        entry  = round(price, 2)
+        sl     = round(price - atr * sl_mult, 2)
+        tp1    = round(price + atr * tp1_mult, 2)
+        tp2    = round(price + atr * tp2_mult, 2)
+    else:
+        entry  = round(price, 2)
+        sl     = round(price + atr * sl_mult, 2)
+        tp1    = round(price - atr * tp1_mult, 2)
+        tp2    = round(price - atr * tp2_mult, 2)
+
+    risk_pct  = round(abs(entry - sl) / entry * 100, 2)
+    reward1   = round(abs(tp1 - entry) / abs(entry - sl), 1) if sl != entry else 0
+    reward2   = round(abs(tp2 - entry) / abs(entry - sl), 1) if sl != entry else 0
+
+    # 置信度分級
+    if wr >= 99:   conf_tag = "⭐⭐⭐ 極高置信"; conf_color = "#00ff88"
+    elif wr >= 90: conf_tag = "⭐⭐ 高置信";    conf_color = "#44ee66"
+    elif wr >= 70: conf_tag = "⭐ 中高置信";   conf_color = "#aaee44"
+    else:          conf_tag = "📊 參考";        conf_color = "#ffcc44"
+
+    sug_key = f"{symbol}|{period}|{direction}|{entry}|{desc[:20]}"
+    if sug_key in st.session_state.sent_suggestions:
+        return
+
+    st.session_state.sent_suggestions.add(sug_key)
+    now = datetime.now().strftime("%H:%M:%S")
+    suggestion = {
+        "時間":       now,
+        "股票":       symbol,
+        "週期":       period,
+        "方向":       direction,
+        "進場":       entry,
+        "止損":       sl,
+        "止盈1":      tp1,
+        "止盈2":      tp2,
+        "風險%":      risk_pct,
+        "盈虧比1":    reward1,
+        "盈虧比2":    reward2,
+        "WR":         wr,
+        "樣本數":     n_samples,
+        "置信":       conf_tag,
+        "置信色":     conf_color,
+        "描述":       desc,
+        "來源信號":   signal_msg[:80],
+        "ATR":        round(atr, 2),
+        "狀態":       "待確認",   # 待確認 / 已採納 / 已忽略
+    }
+    st.session_state.trade_suggestions.insert(0, suggestion)
+    st.session_state.trade_suggestions = st.session_state.trade_suggestions[:50]
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 數據抓取
+# 交易日誌系統（Trading Log System）
+# 記錄：計算步驟 → 訊號決策 → 交易記錄 → 績效統計
+# ══════════════════════════════════════════════════════════════════════════════
+
+def tl_log_calc(symbol: str, period: str, step: str, detail: str,
+                value=None, unit: str = "", level: str = "info"):
+    """
+    記錄計算步驟日誌
+    level: info / trigger / skip / error
+    """
+    entry = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+        "symbol":    symbol,
+        "period":    period,
+        "step":      step,
+        "detail":    detail,
+        "value":     value,
+        "unit":      unit,
+        "level":     level,
+    }
+    st.session_state.calc_log.insert(0, entry)
+    st.session_state.calc_log = st.session_state.calc_log[:500]
+
+
+def tl_log_decision(symbol: str, period: str, detector: str,
+                    triggered: bool, reason: str,
+                    signal_type: str = "info", confidence: int = 50,
+                    key_values: dict = None):
+    """
+    記錄偵測器決策日誌
+    detector:    偵測器名稱（如 E0, I2, G7...）
+    triggered:   是否觸發
+    reason:      觸發/未觸發原因
+    confidence:  信心度 0-100
+    key_values:  關鍵計算值 dict
+    """
+    entry = {
+        "timestamp":   datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "symbol":      symbol,
+        "period":      period,
+        "detector":    detector,
+        "triggered":   triggered,
+        "signal_type": signal_type,
+        "reason":      reason,
+        "confidence":  confidence,
+        "key_values":  key_values or {},
+    }
+    st.session_state.decision_log.insert(0, entry)
+    st.session_state.decision_log = st.session_state.decision_log[:300]
+
+
+def tl_open_trade(symbol: str, direction: str, entry_price: float,
+                  entry_time: str = None, size: float = 1.0,
+                  stop_loss: float = None, take_profit: float = None,
+                  reason: str = "", signals: list = None,
+                  period: str = "") -> str:
+    """
+    開倉記錄
+    direction: LONG / SHORT
+    返回 trade_id
+    """
+    tid = f"T{st.session_state.trade_id_counter:04d}"
+    st.session_state.trade_id_counter += 1
+    now = entry_time or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    trade = {
+        "trade_id":    tid,
+        "symbol":      symbol,
+        "direction":   direction,
+        "entry_price": entry_price,
+        "entry_time":  now,
+        "size":        size,
+        "stop_loss":   stop_loss,
+        "take_profit": take_profit,
+        "entry_reason": reason,
+        "entry_signals": signals or [],
+        "period":      period,
+        "status":      "OPEN",
+        "exit_price":  None,
+        "exit_time":   None,
+        "exit_reason": None,
+        "pnl":         None,
+        "pnl_pct":     None,
+        "duration":    None,
+        "calc_steps":  [],   # 開倉時的計算快照
+    }
+    st.session_state.open_trades[tid] = trade
+    st.session_state.trade_log.insert(0, trade)
+    st.session_state.trade_log = st.session_state.trade_log[:200]
+    return tid
+
+
+def tl_close_trade(trade_id: str, exit_price: float,
+                   exit_time: str = None, reason: str = "") -> dict:
+    """
+    平倉記錄，計算損益
+    返回平倉後的 trade dict
+    """
+    if trade_id not in st.session_state.open_trades:
+        return {}
+
+    trade = st.session_state.open_trades[trade_id]
+    now   = exit_time or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    ep  = trade["entry_price"]
+    xp  = exit_price
+    sz  = trade["size"]
+    dir = trade["direction"]
+
+    raw_pnl = (xp - ep) if dir == "LONG" else (ep - xp)
+    pnl     = raw_pnl * sz
+    pnl_pct = raw_pnl / ep * 100
+
+    # 計算持倉時間
+    try:
+        t0 = datetime.strptime(trade["entry_time"], "%Y-%m-%d %H:%M:%S")
+        t1 = datetime.strptime(now,                 "%Y-%m-%d %H:%M:%S")
+        dur_min = int((t1 - t0).total_seconds() / 60)
+        duration = f"{dur_min}分鐘" if dur_min < 60 else f"{dur_min//60}時{dur_min%60}分"
+    except Exception:
+        duration = "N/A"
+
+    trade.update({
+        "status":      "CLOSED",
+        "exit_price":  exit_price,
+        "exit_time":   now,
+        "exit_reason": reason,
+        "pnl":         round(pnl, 4),
+        "pnl_pct":     round(pnl_pct, 3),
+        "duration":    duration,
+    })
+
+    # 從未平倉中移除
+    del st.session_state.open_trades[trade_id]
+
+    # 更新 trade_log 中的記錄
+    for i, t in enumerate(st.session_state.trade_log):
+        if t["trade_id"] == trade_id:
+            st.session_state.trade_log[i] = trade
+            break
+
+    return trade
+
+
+def tl_calc_stats() -> dict:
+    """計算整體績效統計"""
+    closed = [t for t in st.session_state.trade_log if t["status"] == "CLOSED"]
+    if not closed:
+        return {"total": 0}
+
+    pnls     = [t["pnl_pct"] for t in closed if t["pnl_pct"] is not None]
+    wins     = [p for p in pnls if p > 0]
+    losses   = [p for p in pnls if p <= 0]
+    total    = len(pnls)
+    win_rate = len(wins) / total * 100 if total > 0 else 0
+    avg_win  = sum(wins)  / len(wins)  if wins   else 0
+    avg_loss = sum(losses)/ len(losses)if losses  else 0
+    profit_factor = abs(sum(wins) / sum(losses)) if sum(losses) != 0 else float("inf")
+    total_pnl_pct = sum(pnls)
+
+    # 最大回撤
+    cumulative = []
+    cum = 0
+    for p in reversed(pnls):
+        cum += p
+        cumulative.append(cum)
+    peak = 0
+    max_dd = 0
+    for c in cumulative:
+        if c > peak: peak = c
+        dd = peak - c
+        if dd > max_dd: max_dd = dd
+
+    return {
+        "total":          total,
+        "wins":           len(wins),
+        "losses":         len(losses),
+        "win_rate":       round(win_rate, 1),
+        "avg_win":        round(avg_win, 3),
+        "avg_loss":       round(avg_loss, 3),
+        "profit_factor":  round(profit_factor, 2),
+        "total_pnl_pct":  round(total_pnl_pct, 3),
+        "max_drawdown":   round(max_dd, 3),
+        "expectancy":     round(win_rate/100*avg_win + (1-win_rate/100)*avg_loss, 3),
+    }
+
+
+def tl_log_psychology(symbol: str, emotion: str, note: str,
+                      pnl_pct: float, trade_id: str,
+                      confidence: int = 50, fatigue: int = 30):
+    """
+    記錄交易心理狀態
+    emotion:    冷靜 / 自信 / FOMO / 恐懼 / 貪婪 / 疲勞
+    confidence: 信心度 0-100
+    fatigue:    疲勞度 0-100
+    """
+    entry = {
+        "timestamp":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "symbol":     symbol,
+        "trade_id":   trade_id,
+        "emotion":    emotion,
+        "note":       note,
+        "pnl_pct":    pnl_pct,
+        "confidence": confidence,
+        "fatigue":    fatigue,
+    }
+    if "psych_log" not in st.session_state:
+        st.session_state.psych_log = []
+    st.session_state.psych_log.insert(0, entry)
+    st.session_state.psych_log = st.session_state.psych_log[:200]
+def render_trading_log():
+    """完整交易日誌系統 v3.0 - 四大核心模組"""
+    st.markdown("---")
+    st.markdown("""
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;">
+      <div style="font-size:1.5rem;font-weight:900;color:#e0e8ff;font-family:'Courier New',monospace;">
+        📒 TRADING LOG
+      </div>
+      <div style="font-size:0.72rem;color:#445577;padding:2px 10px;
+                  border:1px solid #223355;border-radius:20px;font-family:monospace;">v3.0</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    tabs = st.tabs([
+        "📋 執行記錄", "🛡 風險管理", "📊 Setup績效",
+        "🧠 心理日誌", "📈 績效統計", "➕ 新增交易", "🤖 AI研究"
+    ])
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB 1: 執行記錄（Entry / Exit / Size / PnL / R-multiple）
+    # ══════════════════════════════════════════════════════════════════════════
+    with tabs[0]:
+        st.markdown("#### 📋 交易執行記錄")
+        all_log = st.session_state.trade_log
+        open_tr = st.session_state.open_trades
+
+        # ── 未平倉 ───────────────────────────────────────────────────────────
+        if open_tr:
+            st.markdown(f"**🟡 持倉中（{len(open_tr)}筆）**")
+            for tid, t in open_tr.items():
+                dc   = "#00ee66" if t["direction"]=="LONG" else "#ff5566"
+                dl   = "▲ LONG"  if t["direction"]=="LONG" else "▼ SHORT"
+                sl   = t.get("stop_loss"); tp = t.get("take_profit")
+                risk = abs(t["entry_price"] - sl) if sl else None
+                rr   = abs((tp - t["entry_price"]) / risk) if (tp and risk) else None
+                st.markdown(f"""
+                <div style="background:#0c1220;border-left:3px solid {dc};
+                            border-radius:6px;padding:10px 14px;margin:4px 0;font-family:monospace;font-size:0.82rem;">
+                  <div style="display:flex;justify-content:space-between;">
+                    <div>
+                      <span style="color:#7799cc;">{tid}</span>
+                      <span style="color:{dc};font-weight:700;margin:0 8px;">{dl}</span>
+                      <span style="color:#ccd6ee;font-weight:700;">{t['symbol']}</span>
+                      <span style="color:#556677;margin-left:6px;">{t.get('period','')}</span>
+                    </div>
+                    <span style="color:#ffdd44;font-size:0.72rem;">⏳ OPEN</span>
+                  </div>
+                  <div style="display:flex;gap:20px;margin-top:6px;flex-wrap:wrap;">
+                    <div><span style="color:#445577;">Entry</span> <span style="color:#ccd6ee;font-weight:600;">{t['entry_price']:.2f}</span></div>
+                    <div><span style="color:#445577;">Size</span>  <span style="color:#ccd6ee;">{t['size']}</span></div>
+                    <div><span style="color:#ff5566;">Stop</span>  <span style="color:#ff8888;">{f'{sl:.2f}' if sl else '—'}</span></div>
+                    <div><span style="color:#44dd88;">Target</span><span style="color:#88ffcc;">{f'{tp:.2f}' if tp else '—'}</span></div>
+                    <div><span style="color:#cc88ff;">R:R</span>   <span style="color:#ddaaff;">{f'{rr:.1f}:1' if rr else '—'}</span></div>
+                    <div><span style="color:#445577;">Setup</span> <span style="color:#aabbcc;">{t.get('setup','—')}</span></div>
+                  </div>
+                </div>
+                """, unsafe_allow_html=True)
+                with st.expander(f"平倉 {tid}"):
+                    cx1,cx2,cx3 = st.columns(3)
+                    with cx1: x_px = st.number_input("出場價", value=float(t["entry_price"]), step=0.01, key=f"xpx_{tid}")
+                    with cx2: x_rs = st.text_input("出場原因", key=f"xrs_{tid}")
+                    with cx3: x_em = st.selectbox("情緒狀態", ["冷靜","貪婪","恐懼","FOMO","疲勞","自信"], key=f"xem_{tid}")
+                    if st.button(f"✅ 確認平倉 {tid}", key=f"xcl_{tid}", type="primary"):
+                        res = tl_close_trade(tid, x_px, reason=x_rs)
+                        res["exit_emotion"] = x_em
+                        # 記錄心理日誌
+                        tl_log_psychology(t["symbol"], x_em, x_rs, res.get("pnl_pct",0), tid)
+                        st.success(f"平倉 {tid}：{res['pnl_pct']:+.2f}%")
+                        st.rerun()
+        else:
+            st.info("目前無未平倉交易")
+
+        # ── 已平倉記錄表 ─────────────────────────────────────────────────────
+        closed = [t for t in all_log if t["status"]=="CLOSED"]
+        if closed:
+            st.markdown(f"**📋 已平倉記錄（{len(closed)}筆）**")
+            rows = []
+            for t in closed:
+                ep   = t["entry_price"]; xp = t.get("exit_price", ep)
+                sl   = t.get("stop_loss"); risk = abs(ep-sl) if sl else None
+                pnl  = t.get("pnl_pct",0) or 0
+                r_mult = pnl/100*ep/risk if (risk and risk>0) else None
+                rows.append({
+                    "ID":      t["trade_id"],
+                    "股票":    t["symbol"],
+                    "方向":    t["direction"],
+                    "Setup":   t.get("setup","—"),
+                    "Entry":   ep,
+                    "Exit":    xp,
+                    "Stop":    f"{sl:.2f}" if sl else "—",
+                    "Size":    t["size"],
+                    "PnL%":    f"{pnl:+.2f}%",
+                    "PnL$":    f"{t.get('pnl',0):+.2f}",
+                    "R-mult":  f"{r_mult:+.2f}R" if r_mult else "—",
+                    "持倉":    t.get("duration","—"),
+                    "情緒":    t.get("exit_emotion","—"),
+                })
+            df_c = pd.DataFrame(rows)
+            def _color(val):
+                if "+" in str(val) and val!="—": return "color:#00ee66;font-weight:bold"
+                if "-" in str(val) and val!="—": return "color:#ff5566;font-weight:bold"
+                return ""
+            st.dataframe(df_c.style.applymap(_color, subset=["PnL%","PnL$","R-mult"]),
+                         use_container_width=True, height=280)
+            csv = df_c.to_csv(index=False, encoding="utf-8-sig")
+            st.download_button("📥 下載 CSV", csv,
+                               f"trades_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                               mime="text/csv")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB 2: 風險管理（Position Sizing / Risk% / Stop / R-multiples）
+    # ══════════════════════════════════════════════════════════════════════════
+    with tabs[1]:
+        st.markdown("#### 🛡 風險管理儀表板")
+        rc1, rc2 = st.columns([1,2])
+        with rc1:
+            st.markdown("**⚙️ 風控參數**")
+            acct_size  = st.number_input("帳戶資金 ($)", value=float(st.session_state.get("_acct_size",100000)), step=1000.0, key="_acct_size_input")
+            risk_pct   = st.number_input("單筆風險 %", value=float(st.session_state.get("_risk_pct",1.0)), step=0.1, min_value=0.1, max_value=5.0, key="_risk_pct_input")
+            st.session_state["_acct_size"] = acct_size
+            st.session_state["_risk_pct"]  = risk_pct
+            max_risk_amt = acct_size * risk_pct / 100
+            st.markdown(f"""
+            <div style="background:#0c1220;border:1px solid #1e3050;border-radius:8px;padding:12px;margin-top:8px;font-family:monospace;">
+              <div style="color:#445577;font-size:0.72rem;">單筆最大風險金額</div>
+              <div style="color:#ff8855;font-size:1.4rem;font-weight:900;">${max_risk_amt:,.0f}</div>
+              <div style="color:#445577;font-size:0.72rem;margin-top:8px;">當前持倉風險</div>
+              <div style="color:#ffdd44;font-size:1.1rem;font-weight:700;">
+                ${sum(abs(t['entry_price']-t.get('stop_loss',t['entry_price']))*t['size']
+                      for t in st.session_state.open_trades.values()
+                      if t.get('stop_loss')):,.0f}
+              </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        with rc2:
+            st.markdown("**🧮 倉位計算器**")
+            ps1, ps2, ps3 = st.columns(3)
+            with ps1: ps_entry = st.number_input("進場價", value=400.0, step=0.01, key="ps_entry")
+            with ps2: ps_stop  = st.number_input("止損價", value=395.0, step=0.01, key="ps_stop")
+            with ps3: ps_sym   = st.text_input("股票",   value="TSLA",               key="ps_sym")
+            if ps_entry != ps_stop:
+                risk_per_share = abs(ps_entry - ps_stop)
+                shares = int(max_risk_amt / risk_per_share)
+                total_exposure = shares * ps_entry
+                pct_of_acct    = total_exposure / acct_size * 100
+                st.markdown(f"""
+                <div style="background:#0a1020;border:1px solid #223355;border-radius:8px;
+                            padding:14px;font-family:monospace;">
+                  <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:12px;text-align:center;">
+                    <div>
+                      <div style="color:#445577;font-size:0.72rem;">建議股數</div>
+                      <div style="color:#00ee66;font-size:1.5rem;font-weight:900;">{shares}</div>
+                    </div>
+                    <div>
+                      <div style="color:#445577;font-size:0.72rem;">每股風險</div>
+                      <div style="color:#ff8855;font-size:1.5rem;font-weight:900;">${risk_per_share:.2f}</div>
+                    </div>
+                    <div>
+                      <div style="color:#445577;font-size:0.72rem;">總曝險</div>
+                      <div style="color:#ffdd44;font-size:1.5rem;font-weight:900;">${total_exposure:,.0f}</div>
+                    </div>
+                    <div>
+                      <div style="color:#445577;font-size:0.72rem;">佔帳戶</div>
+                      <div style="color:#cc88ff;font-size:1.5rem;font-weight:900;">{pct_of_acct:.1f}%</div>
+                    </div>
+                  </div>
+                  <div style="margin-top:12px;padding:8px;background:#141c2e;border-radius:6px;
+                              font-size:0.78rem;color:#667799;">
+                    止損金額: <span style="color:#ff5566;">${shares*risk_per_share:,.0f}</span>
+                    （{risk_pct}% 帳戶）　
+                    1R = ${shares*risk_per_share:,.0f}　
+                    2R目標 = ${ps_entry + (ps_entry-ps_stop)*2:.2f}　
+                    3R目標 = ${ps_entry + (ps_entry-ps_stop)*3:.2f}
+                  </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+        # ── R-multiple 分布圖 ─────────────────────────────────────────────────
+        closed_r = [t for t in st.session_state.trade_log
+                    if t["status"]=="CLOSED" and t.get("stop_loss") and t.get("pnl_pct")]
+        if len(closed_r) >= 2:
+            st.markdown("**📊 R-Multiple 分布**")
+            r_mults = []
+            for t in closed_r:
+                ep = t["entry_price"]; sl = t["stop_loss"]; risk = abs(ep-sl)
+                if risk > 0:
+                    r_mults.append(t["pnl_pct"]/100*ep/risk)
+            if r_mults:
+                import plotly.graph_objects as go
+                colors = ["#00ee66" if r>=0 else "#ff5566" for r in r_mults]
+                fig = go.Figure(go.Bar(y=r_mults, marker_color=colors, opacity=0.85, marker_line_width=0))
+                fig.add_hline(y=0, line_color="#334455", line_width=1)
+                fig.add_hline(y=1, line_color="rgba(0,238,102,0.25)", line_width=1, line_dash="dot")
+                fig.add_hline(y=2, line_color="rgba(255,221,68,0.25)", line_width=1, line_dash="dot")
+                fig.update_layout(paper_bgcolor="#0a0e18", plot_bgcolor="#0c1220",
+                                  font=dict(color="#7799cc",family="monospace"),
+                                  height=220, margin=dict(l=40,r=10,t=10,b=30),
+                                  yaxis=dict(gridcolor="#1a2535",title="R"),
+                                  xaxis=dict(gridcolor="#1a2535",title="交易序號"))
+                st.plotly_chart(fig, use_container_width=True)
+                avg_r = sum(r_mults)/len(r_mults)
+                st.markdown(f"平均R: **{avg_r:+.2f}R**　最大虧損: **{min(r_mults):.2f}R**　最大獲利: **{max(r_mults):.2f}R**")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB 3: Setup績效（每個偵測器的實際勝率/盈虧/Expectancy）
+    # ══════════════════════════════════════════════════════════════════════════
+    with tabs[2]:
+        st.markdown("#### 📊 Setup 績效分析")
+        closed_all = [t for t in st.session_state.trade_log if t["status"]=="CLOSED"]
+        if not closed_all:
+            st.info("尚無已平倉交易記錄")
+        else:
+            from collections import defaultdict
+            setup_stats = defaultdict(lambda: {"trades":[]})
+            for t in closed_all:
+                s = t.get("setup","未分類")
+                pnl = t.get("pnl_pct",0) or 0
+                ep  = t["entry_price"]; sl = t.get("stop_loss")
+                risk = abs(ep-sl) if sl else None
+                r = pnl/100*ep/risk if (risk and risk>0) else None
+                setup_stats[s]["trades"].append({"pnl":pnl,"r":r,"tid":t["trade_id"]})
+
+            # 計算每個 Setup 的統計
+            rows_s = []
+            for setup, data in sorted(setup_stats.items()):
+                trs   = data["trades"]
+                n     = len(trs)
+                wins  = [x for x in trs if x["pnl"]>0]
+                loss  = [x for x in trs if x["pnl"]<=0]
+                wr    = len(wins)/n*100 if n>0 else 0
+                avg_w = sum(x["pnl"] for x in wins)/len(wins)   if wins else 0
+                avg_l = sum(x["pnl"] for x in loss)/len(loss)   if loss else 0
+                exp   = wr/100*avg_w + (1-wr/100)*avg_l
+                r_vals = [x["r"] for x in trs if x["r"] is not None]
+                avg_r  = sum(r_vals)/len(r_vals) if r_vals else None
+                rows_s.append({
+                    "Setup":      setup,
+                    "筆數":       n,
+                    "勝率%":      f"{wr:.0f}%",
+                    "平均獲利%":  f"{avg_w:+.2f}%",
+                    "平均虧損%":  f"{avg_l:+.2f}%",
+                    "期望值%":    f"{exp:+.2f}%",
+                    "平均R":      f"{avg_r:+.2f}R" if avg_r else "—",
+                    "評級":       ("⭐⭐⭐" if wr>=60 and (avg_r or 0)>=1.5
+                                   else "⭐⭐" if wr>=50 else "⭐" if exp>0 else "❌"),
+                })
+
+            df_s = pd.DataFrame(rows_s).sort_values("期望值%", ascending=False)
+            def _color_setup(val):
+                if "+" in str(val): return "color:#00ee66;font-weight:bold"
+                if "-" in str(val): return "color:#ff5566;font-weight:bold"
+                if "⭐" in str(val): return "color:#ffdd44"
+                if "❌" in str(val): return "color:#ff4444"
+                return ""
+            st.dataframe(df_s.style.applymap(_color_setup,
+                         subset=["平均獲利%","平均虧損%","期望值%","平均R","評級"]),
+                         use_container_width=True, height=320)
+
+            # 最佳/最差 Setup
+            best = rows_s[0] if rows_s else None
+            if best:
+                st.markdown(f"""
+                <div style="display:flex;gap:12px;margin-top:8px;">
+                  <div style="background:#0d2218;border:1px solid #00ee6633;border-radius:8px;
+                              padding:10px 16px;flex:1;font-family:monospace;font-size:0.82rem;">
+                    <div style="color:#00ee66;font-weight:700;">🏆 最佳 Setup</div>
+                    <div style="color:#ccd6ee;margin-top:4px;">{best['Setup']}</div>
+                    <div style="color:#aabbcc;">期望值 {best['期望值%']}　勝率 {best['勝率%']}　{best['平均R']}</div>
+                  </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB 4: 心理日誌（情緒/疲勞/FOMO/信心 vs 交易結果）
+    # ══════════════════════════════════════════════════════════════════════════
+    with tabs[3]:
+        st.markdown("#### 🧠 交易心理日誌")
+        psych_log = st.session_state.get("psych_log", [])
+
+        # 情緒 vs 勝率統計
+        if psych_log:
+            from collections import defaultdict
+            emo_stats = defaultdict(lambda:{"wins":0,"total":0,"pnls":[]})
+            for e in psych_log:
+                em = e.get("emotion","未知")
+                emo_stats[em]["total"] += 1
+                emo_stats[em]["pnls"].append(e.get("pnl_pct",0))
+                if e.get("pnl_pct",0) > 0: emo_stats[em]["wins"] += 1
+
+            st.markdown("**📊 情緒狀態 vs 勝率（核心統計）**")
+            emo_colors = {
+                "冷靜":"#00ee66","自信":"#44dd88",
+                "FOMO":"#ff5566","恐懼":"#ff8855",
+                "貪婪":"#ffaa00","疲勞":"#cc6655","其他":"#7799cc"
+            }
+            cards = ['<div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:16px;">']
+            for em, data in sorted(emo_stats.items(), key=lambda x:-x[1]["total"]):
+                n    = data["total"]; wins = data["wins"]
+                wr   = wins/n*100 if n>0 else 0
+                avg  = sum(data["pnls"])/n if n>0 else 0
+                col  = emo_colors.get(em,"#7799cc")
+                warn = "⚠️" if (wr<40 and n>=2) else ""
+                cards.append(f"""
+                <div style="background:#0c1220;border:1px solid {col}44;border-left:3px solid {col};
+                            border-radius:8px;padding:10px 14px;min-width:120px;font-family:monospace;">
+                  <div style="color:{col};font-weight:700;font-size:0.85rem;">{warn}{em}</div>
+                  <div style="color:#ccd6ee;font-size:1.4rem;font-weight:900;">{wr:.0f}%</div>
+                  <div style="background:#141c2e;border-radius:2px;height:3px;margin:4px 0;">
+                    <div style="width:{wr}%;background:{col};height:3px;border-radius:2px;"></div>
+                  </div>
+                  <div style="color:#445566;font-size:0.72rem;">{n}筆　avg{avg:+.1f}%</div>
+                </div>""")
+            cards.append("</div>")
+            st.markdown("".join(cards), unsafe_allow_html=True)
+
+            # 情緒交易警告
+            bad_emotions = {em:d for em,d in emo_stats.items()
+                            if d["total"]>=2 and d["wins"]/d["total"]<0.4}
+            if bad_emotions:
+                st.markdown("""
+                <div style="background:#2a0d0d;border:1px solid #ff444444;border-radius:8px;
+                            padding:12px 16px;margin-bottom:12px;">
+                  <div style="color:#ff5566;font-weight:700;margin-bottom:6px;">
+                    🚨 情緒交易警告
+                  </div>""" +
+                "".join(f'<div style="color:#cc8888;font-size:0.82rem;margin:2px 0;">'
+                        f'{em}狀態下勝率僅 {d["wins"]/d["total"]*100:.0f}%'
+                        f'（{d["total"]}筆），建議此狀態下暫停交易</div>'
+                        for em,d in bad_emotions.items()) +
+                "</div>", unsafe_allow_html=True)
+
+            # 心理日誌列表
+            st.markdown("**📝 心理記錄**")
+            for e in psych_log[-20:][::-1]:
+                em  = e.get("emotion","—")
+                col = emo_colors.get(em,"#7799cc")
+                pnl = e.get("pnl_pct",0)
+                st.markdown(f"""
+                <div style="background:#0c1220;border-left:2px solid {col};
+                            border-radius:4px;padding:6px 12px;margin:3px 0;
+                            font-family:monospace;font-size:0.78rem;">
+                  <span style="color:{col};font-weight:700;">{em}</span>
+                  <span style="color:#445566;margin:0 8px;">{e.get('timestamp','')}</span>
+                  <span style="color:{'#00ee66' if pnl>=0 else '#ff5566'};font-weight:600;">{pnl:+.2f}%</span>
+                  <span style="color:#667788;margin-left:10px;">{e.get('note','')}</span>
+                </div>
+                """, unsafe_allow_html=True)
+        else:
+            st.info("尚無心理記錄。平倉時選擇情緒狀態即可自動記錄。")
+
+        # 手動記錄心理狀態
+        with st.expander("✍️ 手動記錄當前心理狀態"):
+            pm1, pm2 = st.columns(2)
+            with pm1:
+                pm_em  = st.selectbox("情緒", ["冷靜","自信","FOMO","恐懼","貪婪","疲勞"], key="pm_em")
+                pm_conf= st.slider("信心度", 0, 100, 60, key="pm_conf")
+            with pm2:
+                pm_fat = st.slider("疲勞度", 0, 100, 30, key="pm_fat")
+                pm_note= st.text_input("備注（市場觀察/今日狀態）", key="pm_note")
+            if st.button("📝 記錄心理狀態", key="pm_save"):
+                tl_log_psychology("—", pm_em, pm_note, 0, "—",
+                                  confidence=pm_conf, fatigue=pm_fat)
+                st.success("已記錄")
+                st.rerun()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB 5: 績效統計（完整Risk-adjusted）
+    # ══════════════════════════════════════════════════════════════════════════
+    with tabs[4]:
+        st.markdown("#### 📈 績效統計（Risk-Adjusted）")
+        stats = tl_calc_stats()
+        if stats.get("total",0) == 0:
+            st.info("尚無已平倉交易")
+        else:
+            t  = stats["total"]; w = stats["wins"]; l = stats["losses"]
+            wr = stats["win_rate"]; pf = stats["profit_factor"]
+            tot = stats["total_pnl_pct"]; dd = stats["max_drawdown"]
+            exp = stats["expectancy"]
+            wr_c  = "#00ee66" if wr>=55 else "#ffdd44" if wr>=40 else "#ff5566"
+            pnl_c = "#00ee66" if tot>=0 else "#ff5566"
+            pf_c  = "#00ee66" if pf>=1.5 else "#ffdd44" if pf>=1 else "#ff5566"
+
+            # KPI 行
+            st.markdown(f"""
+            <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:12px 0;">
+              {''.join(f"""
+              <div style="background:#0a1020;border:1px solid #1e3050;border-radius:10px;padding:14px;text-align:center;">
+                <div style="color:#445577;font-size:0.72rem;">{label}</div>
+                <div style="color:{color};font-size:1.6rem;font-weight:900;font-family:monospace;">{value}</div>
+                <div style="color:#445566;font-size:0.7rem;">{sub}</div>
+              </div>"""
+              for label,value,color,sub in [
+                ("總交易",f"{t}",    "#ccd6ee",f"勝{w}/敗{l}"),
+                ("勝率",  f"{wr:.0f}%",wr_c,    f"W:{w} L:{l}"),
+                ("累計損益",f"{tot:+.1f}%",pnl_c,f"期望值{exp:+.2f}%"),
+                ("獲利因子",f"{pf:.2f}",pf_c,   f"最大回撤{dd:.1f}%"),
+              ])}
+            </div>
+            """, unsafe_allow_html=True)
+
+            # 盈虧曲線
+            closed_c = [t for t in st.session_state.trade_log if t["status"]=="CLOSED"]
+            if len(closed_c) >= 2:
+                import plotly.graph_objects as go
+                pnls = [t.get("pnl_pct",0) for t in reversed(closed_c)]
+                cum  = []; s=0
+                for p in pnls: s+=p; cum.append(s)
+                colors = ["#00ee66" if p>=0 else "#ff5566" for p in pnls]
+                fig = go.Figure()
+                fig.add_trace(go.Bar(y=pnls, name="單筆%", marker_color=colors,
+                                     opacity=0.7, marker_line_width=0))
+                fig.add_trace(go.Scatter(y=cum, name="累計%", mode="lines+markers",
+                                         line=dict(color="#66bbff",width=2),
+                                         marker=dict(size=4)))
+                fig.update_layout(paper_bgcolor="#0a0e18",plot_bgcolor="#0c1220",
+                                  font=dict(color="#7799cc",family="monospace"),
+                                  height=260,margin=dict(l=40,r=10,t=10,b=30),
+                                  legend=dict(orientation="h",y=1.1),
+                                  yaxis=dict(gridcolor="#1a2535",zeroline=True,
+                                             zerolinecolor="#334455"),
+                                  xaxis=dict(gridcolor="#1a2535"))
+                st.plotly_chart(fig, use_container_width=True)
+
+            # 詳細統計
+            st.markdown(f"""
+            <div style="background:#0c1220;border:1px solid #1e2e48;border-radius:8px;
+                        padding:14px 20px;font-family:monospace;font-size:0.82rem;">
+              <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;">
+                <div><span style="color:#445577;">平均獲利</span><span style="color:#00ee66;font-weight:700;margin-left:10px;">+{stats['avg_win']:.2f}%</span></div>
+                <div><span style="color:#445577;">平均虧損</span><span style="color:#ff5566;font-weight:700;margin-left:10px;">{stats['avg_loss']:.2f}%</span></div>
+                <div><span style="color:#445577;">盈虧比</span><span style="color:#ffdd44;font-weight:700;margin-left:10px;">{f"{abs(stats['avg_win']/stats['avg_loss']):.2f}:1" if stats['avg_loss'] != 0 else '∞'}</span></div>
+                <div><span style="color:#445577;">最大回撤</span><span style="color:#ff8855;font-weight:700;margin-left:10px;">-{dd:.2f}%</span></div>
+                <div><span style="color:#445577;">期望值/筆</span><span style="color:{'#00ee66' if exp>=0 else '#ff5566'};font-weight:700;margin-left:10px;">{exp:+.3f}%</span></div>
+                <div><span style="color:#445577;">獲利因子</span><span style="color:{pf_c};font-weight:700;margin-left:10px;">{pf:.2f}</span></div>
+              </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB 6: 新增交易（手動完整填寫）
+    # ══════════════════════════════════════════════════════════════════════════
+    with tabs[5]:
+        st.markdown("#### ➕ 新增交易記錄")
+        na1, na2, na3 = st.columns(3)
+        with na1:
+            na_sym  = st.text_input("股票代號", "TSLA", key="na_sym").upper()
+            na_dir  = st.selectbox("方向", ["LONG","SHORT"], key="na_dir")
+            na_setup= st.selectbox("Setup類型", [
+                "G7-長盤整突破","E0-底部反彈","I1-MACD底背離","I2-MACD頂背離",
+                "N1-ORB突破","N2-整理回測","N3-關鍵水平","O1-MTF共振",
+                "D5-空頭排列","D6-均線壓制",
+                "P1-VIX恐慌反彈","P2-VIX暴漲反向","P3-射擊之星","P5-連跌反彈","P6-跳空量能",
+                "手動/其他"
+            ], key="na_setup")
+        with na2:
+            na_ep   = st.number_input("進場價 (Entry)", value=400.0, step=0.01, key="na_ep")
+            na_sl   = st.number_input("止損價 (Stop)",  value=395.0, step=0.01, key="na_sl")
+            na_tp   = st.number_input("目標價 (Target)",value=410.0, step=0.01, key="na_tp")
+        with na3:
+            na_sz   = st.number_input("股數 (Size)",    value=100.0, step=10.0,  key="na_sz")
+            na_em   = st.selectbox("進場情緒", ["冷靜","自信","FOMO","恐懼","貪婪","疲勞"], key="na_em")
+            na_period= st.text_input("週期", "日K", key="na_period")
+        na_reason = st.text_input("進場理由（可填入觸發訊號）", key="na_reason",
+                                   placeholder="例：G7爆量突破399+EMA5金叉+縮量回測守住")
+        na_note   = st.text_area("交易備注（市場環境/計劃）", key="na_note", height=80,
+                                  placeholder="例：VIX=25高恐慌，但TSLA日K出現底背離，計劃若跌破395立即止損")
+
+        if st.button("📝 記錄開倉", type="primary", key="na_open"):
+            if na_sym and na_ep > 0:
+                # 計算R:R
+                risk_per  = abs(na_ep - na_sl)
+                reward    = abs(na_tp - na_ep)
+                rr_ratio  = reward/risk_per if risk_per > 0 else 0
+                acct      = st.session_state.get("_acct_size",100000)
+                rp        = st.session_state.get("_risk_pct",1.0)
+                max_loss  = acct * rp / 100
+                suggest_sz= int(max_loss / risk_per) if risk_per > 0 else 0
+
+                tid = tl_open_trade(
+                    symbol=na_sym, direction=na_dir,
+                    entry_price=na_ep, size=na_sz,
+                    stop_loss=na_sl if na_sl!=na_ep else None,
+                    take_profit=na_tp if na_tp!=na_ep else None,
+                    reason=na_reason, period=na_period,
+                    signals=na_reason.split("＋") if na_reason else [],
+                )
+                st.session_state.open_trades[tid]["setup"]         = na_setup
+                st.session_state.open_trades[tid]["entry_emotion"] = na_em
+                st.session_state.open_trades[tid]["note"]          = na_note
+                # 記錄心理日誌
+                tl_log_psychology(na_sym, na_em, f"開倉 {na_dir} {na_ep}", 0, tid)
+                tl_log_calc(na_sym, na_period, "手動開倉",
+                            f"{na_dir} @ {na_ep} | SL:{na_sl} | TP:{na_tp} | R:R={rr_ratio:.1f}",
+                            na_ep, "USD", "trigger")
+                st.success(f"✅ 已記錄 {tid}：{na_dir} {na_sym} @ {na_ep:.2f}"
+                           f"　R:R={rr_ratio:.1f}:1　建議股數={suggest_sz}（風控{rp}%）")
+                st.rerun()
+            else:
+                st.error("請填寫股票代號和進場價格")
+
+        # 快速平倉
+        if st.session_state.open_trades:
+            st.markdown("---")
+            st.markdown("**🔒 快速平倉**")
+            qc1,qc2,qc3,qc4 = st.columns(4)
+            with qc1: q_tid = st.selectbox("選擇交易", list(st.session_state.open_trades.keys()), key="q_tid")
+            with qc2: q_xp  = st.number_input("出場價", value=400.0, step=0.01, key="q_xp")
+            with qc3: q_em  = st.selectbox("出場情緒", ["冷靜","自信","FOMO","恐懼","貪婪","疲勞"], key="q_em")
+            with qc4: q_rsn = st.text_input("出場原因", key="q_rsn")
+            if st.button("🔒 確認平倉", type="secondary", key="q_close"):
+                res = tl_close_trade(q_tid, q_xp, reason=q_rsn)
+                res["exit_emotion"] = q_em
+                tl_log_psychology(res["symbol"], q_em, q_rsn, res.get("pnl_pct",0), q_tid)
+                pnl_icon = "🟢" if res["pnl_pct"]>=0 else "🔴"
+                st.success(f"{pnl_icon} {q_tid} 平倉：{res['pnl_pct']:+.2f}% | {res['duration']}")
+                st.rerun()
+
+        # 清除
+        st.markdown("---")
+        if st.button("🗑 清除全部交易日誌", key="clear_all_tl", type="secondary"):
+            for k in ["trade_log","calc_log","decision_log","psych_log"]:
+                st.session_state[k] = []
+            st.session_state.open_trades      = {}
+            st.session_state.trade_id_counter = 1
+            st.success("已清除")
+            st.rerun()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB 7: AI 交易研究（自動發現最佳Setup / 市場環境 / 倉位）
+    # ══════════════════════════════════════════════════════════════════════════
+    with tabs[6]:
+        render_ai_research_tab()
+# ══════════════════════════════════════════════════════════════════════════════
+# AI 交易研究系統 - Trading Intelligence Platform
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _build_research_context() -> dict:
+    """從交易日誌萃取結構化數據供 AI 分析"""
+    closed   = [t for t in st.session_state.trade_log if t["status"] == "CLOSED"]
+    psych    = st.session_state.get("psych_log", [])
+    dec_log  = st.session_state.get("decision_log", [])
+    alerts   = st.session_state.get("alert_log", [])
+
+    if not closed:
+        return {}
+
+    from collections import defaultdict
+
+    # ── Setup 統計 ───────────────────────────────────────────────────────────
+    setup_data = defaultdict(lambda: {"trades": [], "pnls": [], "r_mults": []})
+    for t in closed:
+        s   = t.get("setup", "未分類")
+        pnl = t.get("pnl_pct", 0) or 0
+        ep  = t["entry_price"]; sl = t.get("stop_loss")
+        risk = abs(ep - sl) if sl else None
+        r    = pnl / 100 * ep / risk if (risk and risk > 0) else None
+        setup_data[s]["pnls"].append(pnl)
+        if r: setup_data[s]["r_mults"].append(r)
+
+    setup_summary = {}
+    for s, d in setup_data.items():
+        n    = len(d["pnls"])
+        wins = [p for p in d["pnls"] if p > 0]
+        avg_r = sum(d["r_mults"]) / len(d["r_mults"]) if d["r_mults"] else None
+        setup_summary[s] = {
+            "n": n,
+            "win_rate": len(wins) / n * 100,
+            "avg_pnl": sum(d["pnls"]) / n,
+            "total_pnl": sum(d["pnls"]),
+            "avg_r": round(avg_r, 2) if avg_r else None,
+        }
+
+    # ── 情緒 vs 績效 ─────────────────────────────────────────────────────────
+    emotion_data = defaultdict(lambda: {"wins": 0, "total": 0, "pnls": []})
+    for e in psych:
+        em = e.get("emotion", "未知")
+        emotion_data[em]["total"] += 1
+        pnl = e.get("pnl_pct", 0)
+        emotion_data[em]["pnls"].append(pnl)
+        if pnl > 0: emotion_data[em]["wins"] += 1
+
+    emotion_summary = {
+        em: {
+            "win_rate": d["wins"]/d["total"]*100 if d["total"] else 0,
+            "avg_pnl": sum(d["pnls"])/len(d["pnls"]) if d["pnls"] else 0,
+            "n": d["total"],
+        }
+        for em, d in emotion_data.items()
+    }
+
+    # ── 時間段分析（早盤/午盤/尾盤）────────────────────────────────────────
+    time_data = defaultdict(list)
+    for t in closed:
+        try:
+            h = int(t["entry_time"][11:13])
+            if   h < 10:  slot = "早盤(9-10)"
+            elif h < 12:  slot = "上午(10-12)"
+            elif h < 14:  slot = "午盤(12-14)"
+            elif h < 16:  slot = "下午(14-16)"
+            else:          slot = "尾盤(16+)"
+            time_data[slot].append(t.get("pnl_pct", 0) or 0)
+        except Exception:
+            pass
+
+    time_summary = {
+        slot: {"avg_pnl": sum(v)/len(v), "n": len(v), "win_rate": len([x for x in v if x>0])/len(v)*100}
+        for slot, v in time_data.items() if v
+    }
+
+    # ── 倉位大小 vs 績效 ─────────────────────────────────────────────────────
+    size_buckets = {"小倉(<50)": [], "中倉(50-200)": [], "大倉(>200)": []}
+    for t in closed:
+        sz = t.get("size", 0)
+        p  = t.get("pnl_pct", 0) or 0
+        if sz < 50:    size_buckets["小倉(<50)"].append(p)
+        elif sz < 200: size_buckets["中倉(50-200)"].append(p)
+        else:          size_buckets["大倉(>200)"].append(p)
+
+    size_summary = {
+        k: {"avg_pnl": sum(v)/len(v), "n": len(v)}
+        for k, v in size_buckets.items() if v
+    }
+
+    # ── 最近警示信號統計 ─────────────────────────────────────────────────────
+    signal_counts = defaultdict(int)
+    for a in alerts[:100]:
+        for kw in ["G7","E0","I1","I2","D5","D6","N1","N2","N3","O1","K3","C3","M1","M4"]:
+            if kw in a.get("訊息", ""):
+                signal_counts[kw] += 1
+
+    return {
+        "total_trades":    len(closed),
+        "setup_summary":   setup_summary,
+        "emotion_summary": emotion_summary,
+        "time_summary":    time_summary,
+        "size_summary":    size_summary,
+        "signal_counts":   dict(signal_counts),
+        "overall_win_rate": len([t for t in closed if (t.get("pnl_pct",0) or 0)>0]) / len(closed) * 100,
+        "overall_pnl":      sum(t.get("pnl_pct",0) or 0 for t in closed),
+    }
+
+
+def _call_ai_research(question: str, context: dict, mode: str) -> str:
+    """呼叫 Groq API 進行交易研究分析（使用現有 Groq key）"""
+    import json
+
+    api_key = get_groq_key()
+    if not api_key:
+        return "❌ 未設置 API Key，請在側欄輸入 Groq API Key"
+
+    system_prompts = {
+        "setup": "你是頂尖量化交易分析師。用繁體中文分析Setup績效，直接列出排名和可操作建議，語氣精準有力如Bloomberg報告。",
+        "market": "你是市場環境分析師。用繁體中文分析最適合的市場環境、交易時段和情緒管理建議。",
+        "position": "你是風險管理專家。用繁體中文分析最優倉位大小、止損設置和資金管理規則，基於Kelly公式。",
+    }
+
+    ctx_str = json.dumps(context, ensure_ascii=False, indent=2)
+    user_msg = f"""交易數據：
+{ctx_str}
+
+問題：{question}
+
+要求：1)基於數據給具體結論 2)識別3個最重要發現 3)給立即可執行建議 4)用繁體中文純文字回覆"""
+
+    try:
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}",
+                     "Content-Type": "application/json"},
+            json={
+                "model": "llama-3.3-70b-versatile",
+                "messages": [
+                    {"role": "system", "content": system_prompts.get(mode, system_prompts["setup"])},
+                    {"role": "user",   "content": user_msg},
+                ],
+                "max_tokens": 1500,
+                "temperature": 0.4,
+            },
+            timeout=45,
+        )
+        if resp.status_code == 401:
+            return "❌ Groq API Key 無效"
+        if resp.status_code == 429:
+            return "⏱ 請求頻率限制，請稍後重試"
+        if resp.status_code != 200:
+            return f"❌ API 錯誤 {resp.status_code}"
+        return resp.json()["choices"][0]["message"]["content"]
+    except requests.exceptions.Timeout:
+        return "⏱ 請求超時（45秒），請稍後重試"
+    except Exception as e:
+        return f"❌ 錯誤：{type(e).__name__}: {e}"
+
+
+def render_ai_research_tab():
+    """AI 交易研究介面 - Bloomberg Terminal 風格"""
+    # ── 掃描線背景 + 終端機美學 ──────────────────────────────────────────────
+    st.markdown("""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;600;700&family=Orbitron:wght@700;900&display=swap');
+    .tip-terminal {
+        background: #000;
+        border: 1px solid #ff9900;
+        border-radius: 4px;
+        padding: 20px;
+        font-family: 'IBM Plex Mono', monospace;
+        position: relative;
+        overflow: hidden;
+    }
+    .tip-terminal::before {
+        content: '';
+        position: absolute;
+        top: 0; left: 0; right: 0; bottom: 0;
+        background: repeating-linear-gradient(
+            0deg,
+            transparent,
+            transparent 2px,
+            rgba(255,153,0,0.015) 2px,
+            rgba(255,153,0,0.015) 4px
+        );
+        pointer-events: none;
+    }
+    .tip-header {
+        font-family: 'Orbitron', monospace;
+        color: #ff9900;
+        font-size: 0.65rem;
+        letter-spacing: 3px;
+        margin-bottom: 12px;
+        border-bottom: 1px solid #ff990044;
+        padding-bottom: 8px;
+    }
+    .tip-rank { color: #ff9900; font-weight: 700; }
+    .tip-pos  { color: #00ff88; }
+    .tip-neg  { color: #ff3333; }
+    .tip-dim  { color: #666; font-size: 0.78rem; }
+    .tip-val  { color: #ffcc44; font-weight: 600; }
+    .tip-ai-output {
+        background: #050505;
+        border: 1px solid #ff990066;
+        border-left: 3px solid #ff9900;
+        border-radius: 3px;
+        padding: 16px 20px;
+        font-family: 'IBM Plex Mono', monospace;
+        font-size: 0.8rem;
+        color: #ccaa77;
+        line-height: 1.8;
+        white-space: pre-wrap;
+        margin-top: 12px;
+    }
+    .tip-btn {
+        background: #0a0a0a;
+        border: 1px solid #ff9900;
+        color: #ff9900;
+        font-family: 'IBM Plex Mono', monospace;
+        font-size: 0.72rem;
+        letter-spacing: 2px;
+        padding: 6px 16px;
+        cursor: pointer;
+        transition: all 0.15s;
+    }
+    .tip-metric {
+        display: inline-block;
+        background: #0a0800;
+        border: 1px solid #ff990033;
+        border-radius: 2px;
+        padding: 8px 14px;
+        margin: 4px;
+        text-align: center;
+        font-family: 'IBM Plex Mono', monospace;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    ctx = _build_research_context()
+
+    if not ctx:
+        st.markdown("""
+        <div style="background:#000;border:1px solid #ff9900;border-radius:4px;padding:20px;font-family:'IBM Plex Mono',monospace;">
+          <div style="font-family:'Orbitron',monospace;color:#ff9900;font-size:0.65rem;letter-spacing:3px;margin-bottom:12px;border-bottom:1px solid rgba(255,153,0,0.27);padding-bottom:8px;">◈ TRADING INTELLIGENCE PLATFORM  ◈  NO DATA</div>
+          <div style="color:#ff9900;font-family:'IBM Plex Mono',monospace;font-size:0.82rem;">
+            ▸ 尚無交易記錄可供分析<br>
+            ▸ 請先在「新增交易」Tab 記錄至少 3 筆已平倉交易<br>
+            ▸ 數據越多，AI 分析越精準
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+        return
+
+    n    = ctx["total_trades"]
+    wr   = ctx["overall_win_rate"]
+    pnl  = ctx["overall_pnl"]
+    wr_c = "#00ff88" if wr >= 55 else "#ffcc44" if wr >= 40 else "#ff3333"
+
+    # ── 終端機頂部狀態列 ─────────────────────────────────────────────────────
+    st.markdown(f"""
+    <div style="background:#000;border:1px solid #ff9900;border-radius:4px;padding:20px;font-family:'IBM Plex Mono',monospace;">
+      <div style="font-family:'Orbitron',monospace;color:#ff9900;font-size:0.65rem;letter-spacing:3px;margin-bottom:12px;border-bottom:1px solid rgba(255,153,0,0.27);padding-bottom:8px;">
+        ◈ TRADING INTELLIGENCE PLATFORM v1.0 ◈ LIVE ANALYSIS ◈ {n} TRADES LOADED
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <div style="display:inline-block;background:#0a0800;border:1px solid rgba(255,153,0,0.2);border-radius:2px;padding:8px 14px;margin:4px;text-align:center;font-family:'IBM Plex Mono',monospace;">
+          <div style="color:#666;font-size:0.78rem;">TOTAL TRADES</div>
+          <div style="color:#ff9900;font-weight:700;" style="font-size:1.4rem;">{n}</div>
+        </div>
+        <div style="display:inline-block;background:#0a0800;border:1px solid rgba(255,153,0,0.2);border-radius:2px;padding:8px 14px;margin:4px;text-align:center;font-family:'IBM Plex Mono',monospace;">
+          <div style="color:#666;font-size:0.78rem;">WIN RATE</div>
+          <div style="color:{wr_c};font-size:1.4rem;font-weight:700;">{wr:.1f}%</div>
+        </div>
+        <div style="display:inline-block;background:#0a0800;border:1px solid rgba(255,153,0,0.2);border-radius:2px;padding:8px 14px;margin:4px;text-align:center;font-family:'IBM Plex Mono',monospace;">
+          <div style="color:#666;font-size:0.78rem;">TOTAL PnL</div>
+          <div class="{'tip-pos' if pnl>=0 else 'tip-neg'}" style="font-size:1.4rem;font-weight:700;">{pnl:+.1f}%</div>
+        </div>
+        <div style="display:inline-block;background:#0a0800;border:1px solid rgba(255,153,0,0.2);border-radius:2px;padding:8px 14px;margin:4px;text-align:center;font-family:'IBM Plex Mono',monospace;">
+          <div style="color:#666;font-size:0.78rem;">SETUPS</div>
+          <div style="color:#ffcc44;font-weight:600;" style="font-size:1.4rem;">{len(ctx['setup_summary'])}</div>
+        </div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── 三大研究模組 ─────────────────────────────────────────────────────────
+    col1, col2, col3 = st.columns(3)
+
+    # ══ 模組 1：最賺錢 Setup ══════════════════════════════════════════════════
+    with col1:
+        setup_sm = ctx.get("setup_summary", {})
+        ranked = sorted(setup_sm.items(),
+                        key=lambda x: x[1]["total_pnl"], reverse=True)
+
+        rows_html = ""
+        for i, (s, d) in enumerate(ranked[:6]):
+            medal = ["①","②","③","④","⑤","⑥"][i]
+            wr_s  = d["win_rate"]
+            ap    = d["avg_pnl"]
+            col_s = "#00ff88" if ap > 0 else "#ff3333"
+            r_str = f"{d['avg_r']:+.1f}R" if d.get("avg_r") else "—"
+            rows_html += f"""
+            <div style="border-bottom:1px solid #ff990022;padding:6px 0;display:flex;justify-content:space-between;align-items:center;">
+              <div>
+                <span style="color:#ff9900;font-weight:700;">{medal}</span>
+                <span style="color:#ddbb88;font-size:0.78rem;margin-left:6px;">{s[:18]}</span>
+              </div>
+              <div style="text-align:right;">
+                <span style="color:{col_s};font-weight:700;font-size:0.82rem;">{ap:+.1f}%</span>
+                <span style="color:#666;font-size:0.78rem;" style="margin-left:6px;">{wr_s:.0f}%WR {r_str}</span>
+              </div>
+            </div>"""
+
+        _m1_html = f"""<!DOCTYPE html><html><body style="margin:0;padding:0;background:transparent;">
+        <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600;700&family=Orbitron:wght@700&display=swap" rel="stylesheet">
+        <div style="background:#000;border:1px solid #ff9900;border-radius:4px;padding:16px;font-family:'IBM Plex Mono',monospace;min-height:240px;">
+          <div style="font-family:'Orbitron',monospace;color:#ff9900;font-size:0.6rem;letter-spacing:3px;margin-bottom:10px;border-bottom:1px solid rgba(255,153,0,0.25);padding-bottom:6px;">◈ MODULE 01 ◈ SETUP RANKING</div>
+          <div style="font-size:0.75rem;">{rows_html if rows_html else '<span style="color:#666;">數據不足</span>'}</div>
+        </div></body></html>"""
+        import streamlit.components.v1 as _comp1
+        _comp1.html(_m1_html, height=280, scrolling=False)
+
+        if st.button("🤖 AI 分析最佳 Setup", key="ai_setup", use_container_width=True):
+            with st.spinner("⚡ 分析中..."):
+                result = _call_ai_research("找出最賺錢的Setup和原因，並給出具體改進建議", ctx, "setup")
+                st.session_state["ai_setup_result"] = result
+        if st.session_state.get("ai_setup_result"):
+            _ai_txt = st.session_state["ai_setup_result"]
+            import streamlit.components.v1 as _comp_air
+            _ai_esc = _ai_txt.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+            _ai_h = f'''<!DOCTYPE html><html><body style="margin:0;background:#050505;">
+            <div style="border-left:3px solid #ff9900;padding:14px 18px;font-family:IBM Plex Mono,monospace;
+            font-size:0.8rem;color:#ccaa77;line-height:1.8;white-space:pre-wrap;">{_ai_esc}</div>
+            </body></html>'''
+            _comp_air.html(_ai_h, height=min(60+len(_ai_txt)//2,480), scrolling=True)
+
+    # ══ 模組 2：最適市場環境 ══════════════════════════════════════════════════
+    with col2:
+        time_sm = ctx.get("time_summary", {})
+        emo_sm  = ctx.get("emotion_summary", {})
+
+        time_rows = ""
+        for slot, d in sorted(time_sm.items(), key=lambda x: x[1]["avg_pnl"], reverse=True):
+            c = "#00ff88" if d["avg_pnl"] > 0 else "#ff3333"
+            time_rows += f"""
+            <div style="border-bottom:1px solid #ff990022;padding:5px 0;display:flex;justify-content:space-between;">
+              <span style="color:#ddbb88;font-size:0.78rem;">{slot}</span>
+              <span style="color:{c};font-weight:700;">{d['avg_pnl']:+.1f}%</span>
+              <span style="color:#666;font-size:0.78rem;">{d['win_rate']:.0f}%WR ×{d['n']}</span>
+            </div>"""
+
+        emo_rows = ""
+        best_emo  = max(emo_sm.items(), key=lambda x: x[1]["win_rate"]) if emo_sm else None
+        worst_emo = min(emo_sm.items(), key=lambda x: x[1]["win_rate"]) if emo_sm else None
+        for em, d in sorted(emo_sm.items(), key=lambda x: -x[1]["win_rate"])[:4]:
+            c = "#00ff88" if d["win_rate"] >= 55 else "#ffcc44" if d["win_rate"] >= 40 else "#ff3333"
+            warn = " ⚠" if d["win_rate"] < 40 and d["n"] >= 2 else ""
+            emo_rows += f"""
+            <div style="border-bottom:1px solid #ff990022;padding:4px 0;display:flex;justify-content:space-between;">
+              <span style="color:#ddbb88;font-size:0.78rem;">{em}{warn}</span>
+              <span style="color:{c};font-weight:700;">{d['win_rate']:.0f}%WR</span>
+              <span style="color:#666;font-size:0.78rem;">{d['avg_pnl']:+.1f}% ×{d['n']}</span>
+            </div>"""
+
+        _m2_html = f"""<!DOCTYPE html><html><body style="margin:0;padding:0;background:transparent;">
+        <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600;700&family=Orbitron:wght@700&display=swap" rel="stylesheet">
+        <div style="background:#000;border:1px solid #ff9900;border-radius:4px;padding:16px;font-family:'IBM Plex Mono',monospace;min-height:240px;">
+          <div style="font-family:'Orbitron',monospace;color:#ff9900;font-size:0.6rem;letter-spacing:3px;margin-bottom:10px;border-bottom:1px solid rgba(255,153,0,0.25);padding-bottom:6px;">◈ MODULE 02 ◈ MARKET ENV</div>
+          <div style="color:rgba(255,153,0,0.5);font-size:0.62rem;margin-bottom:4px;">TIME SLOT PERFORMANCE</div>
+          <div style="font-size:0.75rem;margin-bottom:10px;">{time_rows if time_rows else '<span style="color:#666;">需要時間數據</span>'}</div>
+          <div style="color:rgba(255,153,0,0.5);font-size:0.62rem;margin-bottom:4px;">EMOTION STATE ANALYSIS</div>
+          <div style="font-size:0.75rem;">{emo_rows if emo_rows else '<span style="color:#666;">需要情緒記錄</span>'}</div>
+        </div></body></html>"""
+        import streamlit.components.v1 as _comp2
+        _comp2.html(_m2_html, height=320, scrolling=False)
+
+        if st.button("🤖 AI 分析最佳市場環境", key="ai_market", use_container_width=True):
+            with st.spinner("⚡ 分析中..."):
+                result = _call_ai_research("分析最適合的市場環境和交易時段，情緒管理建議", ctx, "market")
+                st.session_state["ai_market_result"] = result
+        if st.session_state.get("ai_market_result"):
+            _ai_txt = st.session_state["ai_market_result"]
+            import streamlit.components.v1 as _comp_air
+            _ai_esc = _ai_txt.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+            _ai_h = f'''<!DOCTYPE html><html><body style="margin:0;background:#050505;">
+            <div style="border-left:3px solid #ff9900;padding:14px 18px;font-family:IBM Plex Mono,monospace;
+            font-size:0.8rem;color:#ccaa77;line-height:1.8;white-space:pre-wrap;">{_ai_esc}</div>
+            </body></html>'''
+            _comp_air.html(_ai_h, height=min(60+len(_ai_txt)//2,480), scrolling=True)
+
+    # ══ 模組 3：最佳倉位 ══════════════════════════════════════════════════════
+    with col3:
+        size_sm = ctx.get("size_summary", {})
+        acct    = st.session_state.get("_acct_size", 100000)
+        risk_p  = st.session_state.get("_risk_pct", 1.0)
+
+        # Kelly 公式計算
+        closed_all = [t for t in st.session_state.trade_log if t["status"] == "CLOSED"]
+        pnls_all   = [t.get("pnl_pct", 0) or 0 for t in closed_all]
+        wins_all   = [p for p in pnls_all if p > 0]
+        loss_all   = [p for p in pnls_all if p <= 0]
+        kelly_str  = "—"
+        if wins_all and loss_all:
+            w_prob = len(wins_all) / len(pnls_all)
+            avg_w  = sum(wins_all) / len(wins_all) / 100
+            avg_l  = abs(sum(loss_all) / len(loss_all)) / 100
+            b      = avg_w / avg_l if avg_l > 0 else 1
+            kelly  = w_prob - (1 - w_prob) / b
+            kelly_str = f"{kelly*100:.1f}%"
+            half_kelly = kelly * 0.5
+            rec_size = int(acct * half_kelly / 0.02) if half_kelly > 0 else 0
+
+        size_rows = ""
+        for k, d in sorted(size_sm.items(), key=lambda x: x[1]["avg_pnl"], reverse=True):
+            c = "#00ff88" if d["avg_pnl"] > 0 else "#ff3333"
+            size_rows += f"""
+            <div style="border-bottom:1px solid #ff990022;padding:5px 0;display:flex;justify-content:space-between;">
+              <span style="color:#ddbb88;font-size:0.78rem;">{k}</span>
+              <span style="color:{c};font-weight:700;">{d['avg_pnl']:+.1f}%</span>
+              <span style="color:#666;font-size:0.78rem;">×{d['n']}筆</span>
+            </div>"""
+
+        _hk_disp = f'{half_kelly*100:.1f}%' if wins_all and loss_all else '—'
+        _m3_html = f"""<!DOCTYPE html><html><body style="margin:0;padding:0;background:transparent;">
+        <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600;700&family=Orbitron:wght@700&display=swap" rel="stylesheet">
+        <div style="background:#000;border:1px solid #ff9900;border-radius:4px;padding:16px;font-family:'IBM Plex Mono',monospace;min-height:240px;">
+          <div style="font-family:'Orbitron',monospace;color:#ff9900;font-size:0.6rem;letter-spacing:3px;margin-bottom:10px;border-bottom:1px solid rgba(255,153,0,0.25);padding-bottom:6px;">◈ MODULE 03 ◈ POSITION SIZING</div>
+          <div style="color:rgba(255,153,0,0.5);font-size:0.62rem;margin-bottom:4px;">SIZE vs PERFORMANCE</div>
+          <div style="font-size:0.75rem;margin-bottom:10px;">{size_rows if size_rows else '<span style="color:#666;">需要倉位數據</span>'}</div>
+          <div style="color:rgba(255,153,0,0.5);font-size:0.62rem;margin-bottom:6px;">KELLY CRITERION</div>
+          <div>
+            <div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid rgba(255,153,0,0.1);">
+              <span style="color:#666;font-size:0.78rem;">Full Kelly</span><span style="color:#ffcc44;font-weight:600;">{kelly_str}</span></div>
+            <div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid rgba(255,153,0,0.1);">
+              <span style="color:#666;font-size:0.78rem;">Half Kelly（建議）</span><span style="color:#00ff88;">{_hk_disp}</span></div>
+            <div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid rgba(255,153,0,0.1);">
+              <span style="color:#666;font-size:0.78rem;">當前風險設置</span><span style="color:#ffcc44;font-weight:600;">{risk_p}%</span></div>
+            <div style="display:flex;justify-content:space-between;padding:5px 0;">
+              <span style="color:#666;font-size:0.78rem;">建議單筆風險$</span><span style="color:#00ff88;">${acct*risk_p/100:,.0f}</span></div>
+          </div>
+        </div></body></html>"""
+        import streamlit.components.v1 as _comp3
+        _comp3.html(_m3_html, height=320, scrolling=False)
+
+        if st.button("🤖 AI 優化倉位策略", key="ai_position", use_container_width=True):
+            with st.spinner("⚡ 分析中..."):
+                result = _call_ai_research(
+                    f"基於Kelly公式={kelly_str}，分析最優倉位大小和止損設置，給出具體資金管理規則",
+                    ctx, "position")
+                st.session_state["ai_position_result"] = result
+        if st.session_state.get("ai_position_result"):
+            _ai_txt = st.session_state["ai_position_result"]
+            import streamlit.components.v1 as _comp_air
+            _ai_esc = _ai_txt.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+            _ai_h = f'''<!DOCTYPE html><html><body style="margin:0;background:#050505;">
+            <div style="border-left:3px solid #ff9900;padding:14px 18px;font-family:IBM Plex Mono,monospace;
+            font-size:0.8rem;color:#ccaa77;line-height:1.8;white-space:pre-wrap;">{_ai_esc}</div>
+            </body></html>'''
+            _comp_air.html(_ai_h, height=min(60+len(_ai_txt)//2,480), scrolling=True)
+
+    # ── 綜合 AI 深度報告 ─────────────────────────────────────────────────────
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown("""
+    <div style="font-family:'IBM Plex Mono',monospace;color:#ff990066;
+                font-size:0.65rem;letter-spacing:3px;text-align:center;margin:8px 0;">
+      ━━━━━━━━━━━━━━━━━━━━━━ DEEP ANALYSIS ━━━━━━━━━━━━━━━━━━━━━━
+    </div>
+    """, unsafe_allow_html=True)
+
+    qcol1, qcol2 = st.columns([3, 1])
+    with qcol1:
+        custom_q = st.text_input("", placeholder="自定義研究問題（例：為何週五的交易勝率特別低？）",
+                                 key="ai_custom_q",
+                                 label_visibility="collapsed")
+    with qcol2:
+        ai_mode = st.selectbox("", ["setup","market","position"],
+                               key="ai_mode_sel", label_visibility="collapsed")
+
+    if st.button("◈ 執行深度分析", key="ai_deep", type="primary", use_container_width=True):
+        q = custom_q or "綜合分析我的交易系統，找出最重要的3個改進點"
+        with st.spinner("⚡ AI 正在深度分析您的交易數據..."):
+            result = _call_ai_research(q, ctx, ai_mode)
+            st.session_state["ai_deep_result"] = result
+
+    if st.session_state.get("ai_deep_result"):
+        _deep_txt = st.session_state["ai_deep_result"]
+        _ts = datetime.now().strftime('%Y-%m-%d %H:%M')
+        st.markdown(f"""
+        <div style="background:#000;border:1px solid #ff9900;border-radius:4px;padding:20px;font-family:IBM Plex Mono,monospace;">
+          <div style="font-family:Orbitron,monospace;color:#ff9900;font-size:0.65rem;letter-spacing:3px;margin-bottom:12px;border-bottom:1px solid rgba(255,153,0,0.27);padding-bottom:8px;">◈ DEEP ANALYSIS REPORT ◈ {_ts}</div>
+          <div style="background:#050505;border-left:3px solid #ff9900;padding:16px 20px;font-family:IBM Plex Mono,monospace;font-size:0.82rem;color:#ccaa77;line-height:1.9;white-space:pre-wrap;">
+{_deep_txt}
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # 清除按鈕
+        if st.button("清除報告", key="clear_ai"):
+            for k in ["ai_setup_result","ai_market_result","ai_position_result","ai_deep_result"]:
+                st.session_state.pop(k, None)
+            st.rerun()
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 @st.cache_data(ttl=60)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1960,6 +4126,44 @@ def calc_rsi(series, period=14):
     loss  = (-delta.clip(upper=0)).rolling(period).mean()
     rs    = gain / loss.replace(0, np.nan)
     return 100 - 100 / (1 + rs)
+
+def calc_adx(df, period=14):
+    """
+    計算 ADX / +DI / -DI（趨勢強度與方向）
+    ADX>25 趨勢有效；-DI>+DI 空頭主導；+DI>-DI 多頭主導
+    """
+    try:
+        hi = df["High"]; lo = df["Low"]; cl = df["Close"]
+        tr = pd.concat([
+            (hi - lo),
+            (hi - cl.shift(1)).abs(),
+            (lo - cl.shift(1)).abs()
+        ], axis=1).max(axis=1)
+        up = hi.diff(); dn = -lo.diff()
+        pdm = up.where((up > dn) & (up > 0), 0.0)
+        ndm = dn.where((dn > up) & (dn > 0), 0.0)
+        atr = tr.ewm(com=period-1, adjust=False).mean()
+        pdi = 100 * pdm.ewm(com=period-1, adjust=False).mean() / atr.replace(0, np.nan)
+        ndi = 100 * ndm.ewm(com=period-1, adjust=False).mean() / atr.replace(0, np.nan)
+        dx  = ((pdi - ndi).abs() / (pdi + ndi).replace(0, np.nan)) * 100
+        adx = dx.ewm(com=period-1, adjust=False).mean()
+        return adx, pdi, ndi
+    except Exception:
+        empty = pd.Series([np.nan]*len(df))
+        return empty, empty, empty
+
+def calc_willr(df, period=14):
+    """
+    Williams %R：範圍 -100~0
+    < -80 超賣（潛在反彈）；> -20 超買（潛在回落）
+    """
+    try:
+        hi_max = df["High"].rolling(period).max()
+        lo_min = df["Low"].rolling(period).min()
+        rng = hi_max - lo_min
+        return -100 * (hi_max - df["Close"]) / rng.replace(0, np.nan)
+    except Exception:
+        return pd.Series([np.nan]*len(df))
 
 
 def calc_pivot(df, interval: str = "1d"):
@@ -2273,6 +4477,215 @@ def detect_channel_signals(df):
 # ══════════════════════════════════════════════════════════════════════════════
 # 警示邏輯
 # ══════════════════════════════════════════════════════════════════════════════
+def detect_candlestick_patterns(df: pd.DataFrame) -> list:
+    """
+    20種K線形態識別（無需TA-Lib）
+    返回：[(name, alert_type, message), ...]
+    只偵測最新1根（單K）或最新2-3根（組合K）
+
+    形態清單：
+    單K：
+      K01 錘頭線        K02 吊頸線        K03 射擊之星      K04 倒錘頭
+      K05 看漲十字星    K06 看跌十字星    K07 蜻蜓十字      K08 墓碑十字
+      K09 紡錘線多      K10 大陽線        K11 大陰線
+    雙K：
+      K12 看漲吞噬      K13 看跌吞噬      K14 看漲孕線      K15 看跌孕線
+      K16 貫穿線        K17 烏雲蓋頂
+    三K：
+      K18 早晨之星      K19 黃昏之星      K20 三白兵 / 三黑鴉
+    """
+    results = []
+    if len(df) < 5:
+        return results
+
+    o  = df["Open"];  h  = df["High"]
+    l  = df["Low"];   c  = df["Close"]
+
+    # ── 最新3根數據 ──────────────────────────────────────────────────────────
+    o1,h1,l1,c1 = float(o.iloc[-1]),float(h.iloc[-1]),float(l.iloc[-1]),float(c.iloc[-1])
+    o2,h2,l2,c2 = float(o.iloc[-2]),float(h.iloc[-2]),float(l.iloc[-2]),float(c.iloc[-2])
+    o3,h3,l3,c3 = float(o.iloc[-3]),float(h.iloc[-3]),float(l.iloc[-3]),float(c.iloc[-3])
+
+    body1  = abs(c1-o1); body2 = abs(c2-o2); body3 = abs(c3-o3)
+    hi1    = max(c1,o1); lo1  = min(c1,o1)
+    hi2    = max(c2,o2); lo2  = min(c2,o2)
+    hi3    = max(c3,o3); lo3  = min(c3,o3)
+    uw1    = h1-hi1;  dw1  = lo1-l1         # 上/下影線（最新根）
+    uw2    = h2-hi2;  dw2  = lo2-l2
+    rng1   = h1-l1 if h1>l1 else 0.001       # 總波幅
+
+    bull1  = c1>o1; bear1 = c1<o1
+    bull2  = c2>o2; bear2 = c2<o2
+    bull3  = c3>o3; bear3 = c3<o3
+
+    # 10日平均實體（判斷「大/小」基準）
+    body_avg = float(abs(c-o).rolling(10).mean().iloc[-1]) or (rng1*0.5)
+    # 近5根趨勢（判斷在上升/下降末端）
+    trend_up   = float(c.iloc[-2]) > float(c.iloc[-6]) if len(c)>=6 else False
+    trend_down = float(c.iloc[-2]) < float(c.iloc[-6]) if len(c)>=6 else False
+
+    # ════════════════ 單K形態 ════════════════════════════════════════════════
+
+    # K01 錘頭線 Hammer（下降趨勢末端，下影≥2×實體，上影<0.3×實體）
+    if (trend_down and body1 > 0 and
+        dw1 >= body1*2 and uw1 <= body1*0.3 and
+        body1 < body_avg*1.5):
+        results.append(("K01-錘頭線", "bull",
+            f"🔨 【K01·錘頭線】下影線{dw1:.2f}≥實體{body1:.2f}×2，下降趨勢末端｜潛在底部反轉，等次根確認收高"))
+
+    # K02 吊頸線 Hanging Man（上升趨勢末端，形狀同錘頭但反向含義）
+    elif (trend_up and body1 > 0 and
+          dw1 >= body1*2 and uw1 <= body1*0.3 and
+          body1 < body_avg*1.5):
+        results.append(("K02-吊頸線", "bear",
+            f"🪝 【K02·吊頸線】上升末端出現錘頭形（下影{dw1:.2f}），主力誘多警告｜需次根收低確認"))
+
+    # K03 射擊之星 Shooting Star（上升趨勢末端，上影≥2×實體，下影<0.3×實體）
+    if (trend_up and body1 > 0 and
+        uw1 >= body1*2 and dw1 <= body1*0.3 and
+        body1 < body_avg*1.5):
+        results.append(("K03-射擊之星", "bear",
+            f"⭐ 【K03·射擊之星】上影線{uw1:.2f}≥實體×2，上升趨勢末端｜潛在頂部反轉警告"))
+
+    # K04 倒錘頭 Inverted Hammer（下降趨勢末端，形狀同射擊之星但偏多）
+    elif (trend_down and body1 > 0 and
+          uw1 >= body1*2 and dw1 <= body1*0.3 and
+          body1 < body_avg*1.5):
+        results.append(("K04-倒錘頭", "bull",
+            f"🔄 【K04·倒錘頭】下降末端上影長{uw1:.2f}，買方試探力量｜需次根大陽線確認反轉"))
+
+    # K05 看漲十字星 Bullish Doji（下降趨勢末端，實體≤波幅3%）
+    if (trend_down and rng1 > 0 and body1/rng1 <= 0.03 and
+        body1 < body_avg*0.1 and rng1 > body_avg*0.3):
+        results.append(("K05-看漲十字星", "bull",
+            f"✚ 【K05·看漲十字星】開收幾乎相同（實體{body1:.3f}），下降趨勢變盤信號"))
+
+    # K06 看跌十字星 Bearish Doji（上升趨勢末端）
+    elif (trend_up and rng1 > 0 and body1/rng1 <= 0.03 and
+          body1 < body_avg*0.1 and rng1 > body_avg*0.3):
+        results.append(("K06-看跌十字星", "bear",
+            f"✚ 【K06·看跌十字星】開收幾乎相同（實體{body1:.3f}），上升趨勢變盤信號"))
+
+    # K07 蜻蜓十字 Dragonfly Doji（開=收=高，長下影）
+    if (body1 < body_avg*0.05 and dw1 >= rng1*0.7 and uw1 <= rng1*0.1):
+        results.append(("K07-蜻蜓十字", "bull",
+            f"🐉 【K07·蜻蜓十字】長下影{dw1:.2f}，強力買盤承接｜底部反轉信號"))
+
+    # K08 墓碑十字 Gravestone Doji（開=收=低，長上影）
+    if (body1 < body_avg*0.05 and uw1 >= rng1*0.7 and dw1 <= rng1*0.1):
+        results.append(("K08-墓碑十字", "bear",
+            f"🪦 【K08·墓碑十字】長上影{uw1:.2f}，高位賣盤強烈｜頂部反轉信號"))
+
+    # K09 紡錘線（多方）小實體+雙影均長，下降趨勢末端→買賣均衡偏多
+    if (trend_down and body1 < body_avg*0.5 and
+        dw1 >= body1 and uw1 >= body1 and
+        rng1 > body_avg*0.5 and bull1):
+        results.append(("K09-多頭紡錘線", "bull",
+            f"🪀 【K09·多頭紡錘線】下降末端多空均衡（實體{body1:.2f}，雙影均長），做空動能減弱"))
+
+    # K10 大陽線（實體≥2.5×10日均實體，bull）
+    if (bull1 and body1 >= body_avg*2.5 and
+        dw1 <= body1*0.2 and uw1 <= body1*0.2):
+        results.append(("K10-大陽線", "bull",
+            f"🚀 【K10·大陽線】實體{body1:.2f}（均值{body_avg:.2f}的{body1/body_avg:.1f}倍），買盤壓倒性強勢"))
+
+    # K11 大陰線（實體≥2.5×10日均實體，bear）
+    if (bear1 and body1 >= body_avg*2.5 and
+        dw1 <= body1*0.2 and uw1 <= body1*0.2):
+        results.append(("K11-大陰線", "bear",
+            f"💥 【K11·大陰線】實體{body1:.2f}（均值{body_avg:.2f}的{body1/body_avg:.1f}倍），賣盤壓倒性強勢"))
+
+    # ════════════════ 雙K形態 ════════════════════════════════════════════════
+
+    # K12 看漲吞噬 Bullish Engulfing（前陰+後大陽完全包覆）
+    if (bear2 and bull1 and
+        o1 <= lo2 and c1 >= hi2 and
+        body1 > body2):
+        results.append(("K12-看漲吞噬", "bull",
+            f"🟢 【K12·看漲吞噬】大陽線完全吞噬前陰線（{body1:.2f}>{body2:.2f}）｜強烈底部反轉"))
+
+    # K13 看跌吞噬 Bearish Engulfing（前陽+後大陰完全包覆）
+    if (bull2 and bear1 and
+        o1 >= hi2 and c1 <= lo2 and
+        body1 > body2):
+        results.append(("K13-看跌吞噬", "bear",
+            f"🔴 【K13·看跌吞噬】大陰線完全吞噬前陽線（{body1:.2f}>{body2:.2f}）｜強烈頂部反轉"))
+
+    # K14 看漲孕線 Bullish Harami（前大陰+後小陽，完全在前實體內）
+    if (bear2 and bull1 and
+        o1 > lo2 and c1 < hi2 and
+        body1 < body2*0.5):
+        results.append(("K14-看漲孕線", "bull",
+            f"🤰 【K14·看漲孕線】小陽線孕育於前大陰內（實體{body1:.2f}<{body2:.2f}×0.5），動能衰竭偏多"))
+
+    # K15 看跌孕線 Bearish Harami（前大陽+後小陰，完全在前實體內）
+    if (bull2 and bear1 and
+        o1 < hi2 and c1 > lo2 and
+        body1 < body2*0.5):
+        results.append(("K15-看跌孕線", "bear",
+            f"🤰 【K15·看跌孕線】小陰線孕育於前大陽內（實體{body1:.2f}<{body2:.2f}×0.5），動能衰竭偏空"))
+
+    # K16 貫穿線 Piercing Line（下降趨勢：前大陰+後陽開於前低下方，收超過前實體中點）
+    if (trend_down and bear2 and bull1 and
+        o1 < l2 and
+        c1 > (o2+c2)/2 and c1 < o2):
+        results.append(("K16-貫穿線", "bull",
+            f"🗡️ 【K16·貫穿線】陽線收盤穿越前陰中點（{c1:.2f}>{(o2+c2)/2:.2f}），底部反轉確認"))
+
+    # K17 烏雲蓋頂 Dark Cloud Cover（上升趨勢：前大陽+後陰開高，收低於前實體中點）
+    if (trend_up and bull2 and bear1 and
+        o1 > h2 and
+        c1 < (o2+c2)/2 and c1 > o2):
+        results.append(("K17-烏雲蓋頂", "bear",
+            f"☁️ 【K17·烏雲蓋頂】陰線收盤穿越前陽中點（{c1:.2f}<{(o2+c2)/2:.2f}），頂部反轉確認"))
+
+    # ════════════════ 三K形態 ════════════════════════════════════════════════
+
+    # K18 早晨之星 Morning Star（下降趨勢：大陰+小實體+大陽）
+    if (trend_down and bear3 and bull1 and
+        body2 < body_avg*0.4 and           # 中間星形小實體
+        body3 > body_avg and body1 > body_avg and
+        c1 > (o3+c3)/2 and                 # 最後陽線收盤過前大陰中點
+        max(o2,c2) < min(o3,c3) and        # 星形與前陰有缺口（下跳）
+        max(o2,c2) < min(o1,c1)):          # 星形與後陽有缺口（上跳）
+        results.append(("K18-早晨之星", "bull",
+            f"🌅 【K18·早晨之星】三K底部反轉：大陰({body3:.2f})+星形({body2:.2f})+大陽({body1:.2f})"
+            f"｜最高置信底部反轉形態！"))
+
+    # K19 黃昏之星 Evening Star（上升趨勢：大陽+小實體+大陰）
+    if (trend_up and bull3 and bear1 and
+        body2 < body_avg*0.4 and
+        body3 > body_avg and body1 > body_avg and
+        c1 < (o3+c3)/2 and
+        min(o2,c2) > max(o3,c3) and        # 星形與前陽有缺口（上跳）
+        min(o2,c2) > max(o1,c1)):          # 星形與後陰有缺口（下跳）
+        results.append(("K19-黃昏之星", "bear",
+            f"🌆 【K19·黃昏之星】三K頂部反轉：大陽({body3:.2f})+星形({body2:.2f})+大陰({body1:.2f})"
+            f"｜最高置信頂部反轉形態！"))
+
+    # K20a 三白兵 Three White Soldiers（連續3根大陽線，每根開在前根實體內，收創新高）
+    if (bull1 and bull2 and bull3 and
+        body1>body_avg and body2>body_avg and body3>body_avg and
+        o1>o2 and o2>o3 and               # 每根開在前根實體內
+        c1>c2 and c2>c3 and               # 每根收盤創新高
+        o1<c2 and o2<c3 and               # 開盤在前根實體內（非跳空）
+        uw1<body1*0.2 and uw2<body2*0.2): # 無長上影（非衰竭）
+        results.append(("K20a-三白兵", "bull",
+            f"⚔️ 【K20a·三白兵】連續3根大陽線逐步推高（{c3:.2f}→{c2:.2f}→{c1:.2f}）｜強烈多頭趨勢確立"))
+
+    # K20b 三黑鴉 Three Black Crows（連續3根大陰線，每根開在前根實體內，收創新低）
+    if (bear1 and bear2 and bear3 and
+        body1>body_avg and body2>body_avg and body3>body_avg and
+        o1<o2 and o2<o3 and
+        c1<c2 and c2<c3 and
+        o1>c2 and o2>c3 and               # 開盤在前根實體內
+        dw1<body1*0.2 and dw2<body2*0.2):
+        results.append(("K20b-三黑鴉", "bear",
+            f"🐦‍⬛ 【K20b·三黑鴉】連續3根大陰線逐步下殺（{c3:.2f}→{c2:.2f}→{c1:.2f}）｜強烈空頭趨勢確立"))
+
+    return results
+
+
 def run_alerts(symbol, period_label, df, trigger_ai=False, mkt=None):
     """
     偵測四大類技術信號：
@@ -2407,6 +4820,12 @@ def run_alerts(symbol, period_label, df, trigger_ai=False, mkt=None):
                               f"，EMA5止跌＋DIF轉向，均線翻多前最早期入場機會"
                               f"｜{'＋'.join(_e0_tags)}，注意確認後再加倉！", "bull")
                     new_signals.append(f"底部反彈初訊+{_e0_recovery:.2f}%")
+                    tl_log_decision(symbol, period_label, "E0",
+                                    triggered=True, signal_type="bull",
+                                    reason=f"空頭排列底部反彈：低點{_e0_low_val:.2f}→{_e0_price:.2f}(+{_e0_recovery:.2f}%)",
+                                    confidence=60,
+                                    key_values={"EMA5止跌": _e0_e5_turning, "DIF轉向": _e0_dif_turn,
+                                                "反彈幅度": f"{_e0_recovery:.2f}%", "低點位置": _e0_low_idx})
         except Exception:
             pass
     if len(close) >= 20:
@@ -2643,6 +5062,15 @@ def run_alerts(symbol, period_label, df, trigger_ai=False, mkt=None):
                   "🔄 反轉訊號｜空頭吞噬（大陰線吞噬前陽線）", "bear")
         new_signals.append("空頭吞噬")
 
+    # ── C2-EXT. 完整20種K線形態偵測（無需TA-Lib）────────────────────────────
+    _candle_signals = detect_candlestick_patterns(df)
+    for _cs_name, _cs_type, _cs_msg in _candle_signals:
+        _cs_ck = f"{symbol}|{period_label}|{_cs_name}|{df.index[-1].strftime('%Y%m%d') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:10]}"
+        if _cs_ck not in st.session_state.sent_alerts:
+            st.session_state.sent_alerts.add(_cs_ck)
+            add_alert(symbol, period_label, _cs_msg, _cs_type)
+            new_signals.append(_cs_name)
+
     # C3. 快速跌破 EMA60（趨勢破壞）
     if (close.iloc[-1] < e60.iloc[-1] and
             close.iloc[-2] >= e60.iloc[-2] and
@@ -2744,7 +5172,40 @@ def run_alerts(symbol, period_label, df, trigger_ai=False, mkt=None):
                               f"，深度越深反轉力度越強，底部反彈確認！", "bull")
                     new_signals.append(f"MACD深谷金叉{_dif_min:.2f}")
 
-    # C4. EMA5/EMA10 黃金/死亡交叉（短線反轉確認）
+    # C3d. MACD 深谷震盪底（圖中特殊場景：DIF=-7.37但柱→-0.099，DIF與DEA快要貼合）
+    # 與C3c不同：C3c是「剛完成金叉」，C3d是「即將金叉但DIF仍在極深位，需謹慎」
+    if len(hist) >= 10 and len(dif) >= 10:
+        _c3d_dif_cur   = float(dif.iloc[-1])
+        _c3d_dea_cur   = float(dea.iloc[-1])
+        _c3d_hist_cur  = float(hist.iloc[-1])
+        _c3d_hist_min  = float(hist.iloc[-40:].min()) if len(hist) >= 40 else float(hist.min())
+        _c3d_hist_range = abs(_c3d_hist_min)
+
+        # 條件：DIF在極深負值（<-3），但柱已收縮至不足原來10%（即將金叉）
+        _c3d_deep_dif   = _c3d_dif_cur < -3.0
+        _c3d_hist_tiny  = _c3d_hist_range > 0 and abs(_c3d_hist_cur) < _c3d_hist_range * 0.1
+        _c3d_near_cross = abs(_c3d_dif_cur - _c3d_dea_cur) < abs(_c3d_dif_cur) * 0.02  # 差距<2%
+        _c3d_dif_rising = float(dif.iloc[-1]) > float(dif.iloc[-3])  # DIF仍在上升
+
+        if _c3d_deep_dif and _c3d_hist_tiny and _c3d_near_cross:
+            _c3d_ck = f"{symbol}|{period_label}|MACD深谷震盪底|{df.index[-1].strftime('%Y%m%d%H') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:13]}"
+            if _c3d_ck not in st.session_state.sent_alerts:
+                st.session_state.sent_alerts.add(_c3d_ck)
+                _recovery_pct = (abs(_c3d_hist_cur) / _c3d_hist_range) * 100
+                add_alert(symbol, period_label,
+                          f"⚡ 【MACD深谷震盪底】DIF={_c3d_dif_cur:.3f}（極深負值）"
+                          f"，MACD柱已從最深{_c3d_hist_min:.2f}收縮至{_c3d_hist_cur:.3f}"
+                          f"（僅剩{_recovery_pct:.1f}%），DIF即將與DEA={_c3d_dea_cur:.3f}金叉"
+                          f"，⚠️ 注意：DIF仍在極深位，非真實反轉！"
+                          f"需配合價格突破均線壓力帶才能確認{'（DIF持續上升中）' if _c3d_dif_rising else '（DIF未確認上升）'}", "info")
+                new_signals.append(f"MACD深谷震盪底DIF{_c3d_dif_cur:.1f}")
+                tl_log_decision(symbol, period_label, "C3d",
+                                triggered=True, signal_type="info",
+                                reason=f"DIF={_c3d_dif_cur:.2f}極深，柱剩{_recovery_pct:.1f}%，即將金叉但需謹慎",
+                                confidence=45,
+                                key_values={"DIF": _c3d_dif_cur, "DEA": _c3d_dea_cur,
+                                            "柱": _c3d_hist_cur, "柱最深": _c3d_hist_min,
+                                            "已收縮": f"{100-_recovery_pct:.0f}%"})
     if e5.iloc[-1] > e10.iloc[-1] and e5.iloc[-2] <= e10.iloc[-2]:
         add_alert(symbol, period_label,
                   "🔄 反轉訊號｜EMA5 上穿 EMA10（短線動能反轉向上）", "bull")
@@ -2833,6 +5294,187 @@ def run_alerts(symbol, period_label, df, trigger_ai=False, mkt=None):
                   "⚠️ 頂部預警｜多頭 EMA 排列首次出現破口（趨勢轉弱開始）", "bear")
         new_signals.append("多頭排列破口")
 
+    # ── D5. 完整空頭排列確認（圖中核心場景：EMA5<10<20<30<60<120<200）────────
+    # D 節原有偵測器只抓「剛死叉瞬間」，但圖中已完成排列，持續壓制更重要
+    _e120 = calc_ema(close, 120)
+    _e200 = calc_ema(close, 200) if len(close) >= 200 else None
+
+    _e_now_ext = {5: e5.iloc[-1], 10: e10.iloc[-1], 20: e20.iloc[-1],
+                  30: e30.iloc[-1], 60: e60.iloc[-1]}
+    _e_now_ext[120] = float(_e120.iloc[-1])
+    if _e200 is not None:
+        _e_now_ext[200] = float(_e200.iloc[-1])
+
+    # 計算有幾層是空頭排列（由小到大均線依次遞增）
+    _bear_layers = []
+    _chain = [5, 10, 20, 30, 60, 120]
+    if _e200 is not None: _chain.append(200)
+    for i in range(len(_chain)-1):
+        a, b = _chain[i], _chain[i+1]
+        if _e_now_ext[a] < _e_now_ext[b]:
+            _bear_layers.append(f"EMA{a}<{b}")
+
+    # 完整空頭排列：5層以上（EMA5<10<20<30<60<120）
+    _full_bear_align = len(_bear_layers) >= 5
+    # 強化版：含EMA200（6層）
+    _ultra_bear_align = (len(_chain) >= 7 and len(_bear_layers) >= 6)
+
+    if _full_bear_align:
+        _d5_ck = f"{symbol}|{period_label}|完整空頭排列確認|{df.index[-1].strftime('%Y%m%d') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:10]}"
+        if _d5_ck not in st.session_state.sent_alerts:
+            st.session_state.sent_alerts.add(_d5_ck)
+            # 計算排列壓力帶：最低均線（EMA5）到最高均線的價差
+            _bear_top = max(_e_now_ext.values())     # 最高均線 = 最大阻力
+            _bear_bot = min(_e_now_ext.values())     # 最低均線 = 第一支撐
+            _align_spread = _bear_top - _bear_bot
+            _align_grade = "🚨 超強空頭" if _ultra_bear_align else "🔴 完整空頭"
+            add_alert(symbol, period_label,
+                      f"{_align_grade}排列｜{'→'.join(['EMA'+str(x) for x in _chain[:len(_bear_layers)+1]])}"
+                      f"（{len(_bear_layers)}層均線全部空頭排列）"
+                      f"，多頭反彈均面臨 {_bear_bot:.2f}-{_bear_top:.2f} 均線壓力帶（寬{_align_spread:.2f}）"
+                      f"，趨勢明確向下，反彈宜輕倉！", "bear")
+            new_signals.append(f"空頭排列{len(_bear_layers)}層確認")
+            tl_log_decision(symbol, period_label, "D5",
+                            triggered=True, signal_type="bear",
+                            reason=f"完整空頭排列{len(_bear_layers)}層，均線壓力帶{_bear_bot:.2f}-{_bear_top:.2f}",
+                            confidence=70 + len(_bear_layers) * 4,
+                            key_values={f"EMA{k}": round(v, 3) for k, v in sorted(_e_now_ext.items())
+                                        if k <= 60})
+
+    # ── D6. 反彈觸及均線壓力帶後拒絕下跌（均線壓制反彈失敗）────────────────
+    # 場景：上漲觸及 EMA5/10 附近，但收盤跌回 → 空頭排列壓制確認
+    if _full_bear_align and len(df) >= 3:
+        _d6_hi   = float(df["High"].iloc[-1]) if "High" in df.columns else price
+        _d6_op   = float(opn.iloc[-1])
+        _d6_cl   = price
+        # 上影線觸及某條均線，但收盤在開盤以下（看跌吞噬/上引線）
+        _upper_shadow = _d6_hi - max(_d6_op, _d6_cl)
+        _body         = abs(_d6_cl - _d6_op)
+        _d6_bear_candle = _d6_cl < _d6_op  # 陰線
+
+        # 找到高點觸及的均線
+        _rejected_ema = None
+        for _ema_p in [5, 10, 20, 30]:
+            _ev = _e_now_ext.get(_ema_p, 0)
+            if abs(_d6_hi - _ev) / _ev < 0.003 and _d6_cl < _ev:  # 高點碰到均線但收在下面
+                _rejected_ema = _ema_p
+                break
+
+        if _rejected_ema and _d6_bear_candle and _upper_shadow > _body * 0.5:
+            _d6_ck = f"{symbol}|{period_label}|反彈均線壓制|{df.index[-1].strftime('%Y%m%d%H') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:13]}"
+            if _d6_ck not in st.session_state.sent_alerts:
+                st.session_state.sent_alerts.add(_d6_ck)
+                add_alert(symbol, period_label,
+                          f"📉 【反彈被均線壓制】K線高點{_d6_hi:.2f}觸及 EMA{_rejected_ema}={_e_now_ext[_rejected_ema]:.2f}"
+                          f" 後收盤{_d6_cl:.2f}跌回均線下方"
+                          f"，上引線={_upper_shadow:.3f} 空頭排列壓制有效！"
+                          f"　做空機會，止損設於 EMA{_rejected_ema} 之上", "bear")
+                new_signals.append(f"反彈EMA{_rejected_ema}壓制")
+                tl_log_decision(symbol, period_label, "D6",
+                                triggered=True, signal_type="bear",
+                                reason=f"反彈至EMA{_rejected_ema}={_e_now_ext[_rejected_ema]:.2f}被壓制，陰線收{_d6_cl:.2f}",
+                                confidence=78,
+                                key_values={"觸及均線": f"EMA{_rejected_ema}", "高點": _d6_hi,
+                                            "收盤": _d6_cl, "上影線": round(_upper_shadow,3)})
+
+    # ── D7. EMA 長短期扭曲結構（圖中關鍵：EMA200在EMA5下方 + EMA120<EMA60）──
+    # 場景：EMA200=395 < EMA5=401，長期均線低於短期 → 長期底部還在下方
+    #       EMA120=415 < EMA60=422 → 中長線空頭扭曲（先下後上的中期下跌）
+    if len(close) >= 120:
+        _d7_e200 = float(calc_ema(close, 200).iloc[-1]) if len(close) >= 200 else None
+        _d7_e120 = float(calc_ema(close, 120).iloc[-1])
+        _d7_e60  = float(e60.iloc[-1])
+        _d7_e5   = float(e5.iloc[-1])
+        _d7_e20  = float(e20.iloc[-1])
+
+        # 情形1：EMA200低於EMA5（長線底部在短線下方 → 夾擊結構）
+        _d7_e200_below_short = _d7_e200 is not None and _d7_e200 < _d7_e5
+        # 情形2：EMA120 < EMA60（中長線倒序 → 空頭深度下跌扭曲）
+        _d7_mid_inverted = _d7_e120 < _d7_e60
+        # 情形3：整體均線離散度 > 5%（高度發散，趨勢強）
+        _all_emas = [_d7_e5, _d7_e20, _d7_e60, _d7_e120]
+        if _d7_e200: _all_emas.append(_d7_e200)
+        _d7_dispersion = (max(_all_emas) - min(_all_emas)) / min(_all_emas) * 100
+
+        if _d7_e200_below_short and _d7_mid_inverted:
+            _d7_ck = f"{symbol}|{period_label}|EMA長短期扭曲|{df.index[-1].strftime('%Y%m%d') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:10]}"
+            if _d7_ck not in st.session_state.sent_alerts:
+                st.session_state.sent_alerts.add(_d7_ck)
+                _squeeze = _d7_e60 - _d7_e200   # 夾擊空間
+                add_alert(symbol, period_label,
+                          f"⚠️ 【EMA長短期扭曲結構】EMA200={_d7_e200:.1f}（長線底部）"
+                          f"仍低於EMA5={_d7_e5:.1f}（短線）"
+                          f"，同時EMA120={_d7_e120:.1f}<EMA60={_d7_e60:.1f}（中長線空頭扭曲）"
+                          f"，價格夾在長線支撐({_d7_e200:.1f})與均線壓力帶({_d7_e5:.1f}-{_d7_e60:.1f})之間"
+                          f"，夾擊空間{_squeeze:.1f}點，趨勢混沌！"
+                          f"　均線離散度{_d7_dispersion:.1f}%（{'高度發散' if _d7_dispersion>5 else '正常'}）", "bear")
+                new_signals.append(f"EMA長短扭曲離散{_d7_dispersion:.0f}%")
+                tl_log_decision(symbol, period_label, "D7",
+                                triggered=True, signal_type="bear",
+                                reason=f"EMA200({_d7_e200:.1f})<EMA5({_d7_e5:.1f})且EMA120<EMA60，離散度{_d7_dispersion:.1f}%",
+                                confidence=72,
+                                key_values={"EMA200": round(_d7_e200,1), "EMA120": round(_d7_e120,1),
+                                            "EMA60": round(_d7_e60,1), "EMA5": round(_d7_e5,1),
+                                            "離散度": f"{_d7_dispersion:.1f}%", "夾擊空間": round(_squeeze,1)})
+
+        elif _d7_mid_inverted and not _d7_e200_below_short:
+            # 僅中長線扭曲（不含EMA200）
+            _d7b_ck = f"{symbol}|{period_label}|EMA中長扭曲|{df.index[-1].strftime('%Y%m%d') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:10]}"
+            if _d7b_ck not in st.session_state.sent_alerts:
+                st.session_state.sent_alerts.add(_d7b_ck)
+                add_alert(symbol, period_label,
+                          f"📊 【EMA中長期扭曲】EMA120={_d7_e120:.1f}<EMA60={_d7_e60:.1f}"
+                          f"（中長線空頭排列倒序），趨勢已有深度下跌後的技術性反彈特徵"
+                          f"，均線離散度{_d7_dispersion:.1f}%", "bear")
+                new_signals.append(f"EMA中長扭曲")
+
+    # ── D8. 均線離散度趨勢強度指標（Dispersion Index）─────────────────────────
+    # 均線越發散 → 趨勢越強；均線收斂 → 趨勢衰退，可能反轉
+    if len(close) >= 60:
+        _d8_emas = {5: float(e5.iloc[-1]), 10: float(e10.iloc[-1]),
+                    20: float(e20.iloc[-1]), 30: float(e30.iloc[-1]),
+                    60: float(e60.iloc[-1])}
+        _d8_prev_emas = {5: float(e5.iloc[-2]), 10: float(e10.iloc[-2]),
+                         20: float(e20.iloc[-2]), 30: float(e30.iloc[-2]),
+                         60: float(e60.iloc[-2])}
+
+        _d8_spread_now  = max(_d8_emas.values()) - min(_d8_emas.values())
+        _d8_spread_prev = max(_d8_prev_emas.values()) - min(_d8_prev_emas.values())
+
+        # 離散度百分比（相對於均值）
+        _d8_mean = sum(_d8_emas.values()) / len(_d8_emas)
+        _d8_di_pct = _d8_spread_now / _d8_mean * 100
+
+        # 離散度在擴大（趨勢加速）
+        _d8_expanding = _d8_spread_now > _d8_spread_prev * 1.05
+
+        # 空頭排列下的高離散度 = 空頭趨勢強度高
+        _d8_is_bear = _d8_emas[5] < _d8_emas[60]
+        _d8_ck_day  = df.index[-1].strftime('%Y%m%d') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:10]
+
+        if _d8_di_pct > 4 and _d8_is_bear:
+            _d8_ck = f"{symbol}|{period_label}|空頭均線高離散|{_d8_ck_day}"
+            if _d8_ck not in st.session_state.sent_alerts:
+                st.session_state.sent_alerts.add(_d8_ck)
+                _d8_grade = "🔴 極高強度" if _d8_di_pct > 7 else "⚠️ 高強度" if _d8_di_pct > 4 else "📊 中等"
+                add_alert(symbol, period_label,
+                          f"{_d8_grade}空頭趨勢｜EMA離散度={_d8_di_pct:.1f}%"
+                          f"（均線最高{max(_d8_emas.values()):.1f}"
+                          f"vs最低{min(_d8_emas.values()):.1f}，差{_d8_spread_now:.1f}點）"
+                          f"，{'離散擴大中（空頭加速）' if _d8_expanding else '離散收縮（趨勢減速）'}"
+                          f"，短線反彈空間受限於均線壓力帶！", "bear")
+                new_signals.append(f"空頭離散度{_d8_di_pct:.1f}%")
+
+        elif _d8_di_pct > 4 and not _d8_is_bear:
+            _d8_ck = f"{symbol}|{period_label}|多頭均線高離散|{_d8_ck_day}"
+            if _d8_ck not in st.session_state.sent_alerts:
+                st.session_state.sent_alerts.add(_d8_ck)
+                add_alert(symbol, period_label,
+                          f"🚀 強勢多頭趨勢｜EMA離散度={_d8_di_pct:.1f}%"
+                          f"（EMA5={_d8_emas[5]:.1f}領跑EMA60={_d8_emas[60]:.1f}）"
+                          f"，{'擴散加速，順勢持多！' if _d8_expanding else '擴散放緩，注意減速'}", "bull")
+                new_signals.append(f"多頭離散度{_d8_di_pct:.1f}%")
+
     # ════════════════════════════════════════════════════════════════════════
     # F. 跳空缺口偵測（掃描最近 N 根，捕捉日K/週K/月K 跳空）
     # ════════════════════════════════════════════════════════════════════════
@@ -2879,6 +5521,10 @@ def run_alerts(symbol, period_label, df, trigger_ai=False, mkt=None):
             p_low   = float(low.iloc[prev_i])
             p_close = float(close.iloc[prev_i])
             if p_close == 0: continue
+
+            # ATR（用於建議交易止損/止盈計算）
+            _atr_window = max(3, min(14, len(close) + bar_i))
+            atr_val = float((high - low).iloc[bar_i-_atr_window:bar_i].mean()) if _atr_window > 0 else float(b_high - b_low)
 
             gap_up_sz   = b_open - p_high
             gap_dn_sz   = p_low  - b_open
@@ -2978,6 +5624,85 @@ def run_alerts(symbol, period_label, df, trigger_ai=False, mkt=None):
                                   f"（開{b_open:.2f} 前低{p_low:.2f}）"
                                   f" 放量×{vol_ratio:.1f}｜{'＋'.join(tags)}", "bear")
                         new_signals.append(f"跳空下跌{gap_dn_pct:.2f}%")
+
+            # ── F6. 衰竭跳空(上) → 空頭訊號（10年回測：隔日收低率100%，n=157）─
+            # 定義：跳空上漲，但今日最高點低於前日最高（無力突破，動能衰竭）
+            # 關鍵識別：今日最高 < 前日最高（HIGH_High_% < 0）
+            if gap_up_pct >= min_gap_pct and vol_surge and b_high < p_high:
+                ck = f"{symbol}|{period_label}|衰竭跳空上|{bar_date}"
+                if ck not in st.session_state.sent_alerts:
+                    st.session_state.sent_alerts.add(ck)
+                    if is_latest:
+                        _fail_pct = (p_high - b_high) / p_high * 100
+                        _f6_msg = (f"🚨🚨 【F6·衰竭跳空(上)】跳空+{gap_up_pct:.2f}%"
+                                   f" 但今高{b_high:.2f}<前高{p_high:.2f}（差{_fail_pct:.2f}%）"
+                                   f" 量×{vol_ratio:.1f}"
+                                   f"｜10年回測隔日收低率100%（n=157）"
+                                   f"，上漲無力／主力出貨，最強空頭信號！")
+                        add_alert(symbol, period_label, _f6_msg, "bear")
+                        new_signals.append(f"F6-衰竭跳空上空頭{gap_up_pct:.1f}%")
+                        generate_trade_suggestion(symbol, period_label, f"F6-衰竭跳空上空頭{gap_up_pct:.1f}%",
+                                                  "bear", b_close, atr_val)
+
+            # ── F7. 衰竭跳空(下) → 多頭訊號（10年回測：隔日收高率100%，n=150）─
+            # 定義：跳空下跌，今日最低點低於前日最低（超跌後市場承接力強）
+            # 關鍵識別：今日最低 < 前日最低
+            if gap_dn_pct >= min_gap_pct and vol_surge and b_low < p_low:
+                ck = f"{symbol}|{period_label}|衰竭跳空下|{bar_date}"
+                if ck not in st.session_state.sent_alerts:
+                    st.session_state.sent_alerts.add(ck)
+                    if is_latest:
+                        _low_ext = (p_low - b_low) / p_low * 100
+                        _f7_msg = (f"🚀🚀 【F7·衰竭跳空(下)反彈】跳空-{gap_dn_pct:.2f}%"
+                                   f" 且今低{b_low:.2f}<前低{p_low:.2f}（超跌{_low_ext:.2f}%）"
+                                   f" 量×{vol_ratio:.1f}"
+                                   f"｜10年回測隔日收高率100%（n=150）"
+                                   f"，超跌承接有力，最強逆向買入！")
+                        add_alert(symbol, period_label, _f7_msg, "bull")
+                        new_signals.append(f"F7-衰竭跳空下反彈{gap_dn_pct:.1f}%")
+                        generate_trade_suggestion(symbol, period_label, f"F7-衰竭跳空下反彈{gap_dn_pct:.1f}%",
+                                                  "bull", b_close, atr_val)
+
+            # ── F8. 持續跳空(上) → 多頭訊號（10年回測：隔日收高率100%，n=90）──
+            # 定義：跳空上漲，且今日最高突破前日最高（延伸突破，趨勢持續）
+            # 關鍵識別：今日最高 > 前日最高（HIGH_High_% > 0）
+            # 與F6相反——同樣跳空上漲，但今高>前高，動能持續而非衰竭
+            if gap_up_pct >= min_gap_pct and vol_surge and b_high > p_high:
+                ck = f"{symbol}|{period_label}|持續跳空上|{bar_date}"
+                if ck not in st.session_state.sent_alerts:
+                    st.session_state.sent_alerts.add(ck)
+                    if is_latest:
+                        _ext_pct = (b_high - p_high) / p_high * 100
+                        _f8_msg = (f"🚀🚀 【F8·持續跳空(上)】跳空+{gap_up_pct:.2f}%"
+                                   f" 且今高{b_high:.2f}>前高{p_high:.2f}（延伸+{_ext_pct:.2f}%）"
+                                   f" 量×{vol_ratio:.1f}"
+                                   f"｜10年回測隔日收高率100%（n=90）"
+                                   f"，突破持續延伸，多頭趨勢最強確認！")
+                        add_alert(symbol, period_label, _f8_msg, "bull")
+                        new_signals.append(f"F8-持續跳空上多頭{gap_up_pct:.1f}%")
+                        generate_trade_suggestion(symbol, period_label, f"F8-持續跳空上多頭{gap_up_pct:.1f}%",
+                                                  "bull", b_close, atr_val)
+
+            # ── F9. 突破/持續跳空(下) → 空頭訊號（10年回測：隔日收低率99%，n=105）
+            # 定義：跳空下跌，且今日最低繼續破前日最低（空頭趨勢持續延伸）
+            # 注：此條件與F7(衰竭跳空下)相同——兩者在數據上完全重疊
+            # F7已覆蓋此偵測，此處作為補充強調空頭版本（用不同識別key）
+            # 特殊情況：跳空下跌 + 今低<前低 + 收陰線（比F7更強的空頭確認）
+            if gap_dn_pct >= min_gap_pct and vol_surge and b_low < p_low and is_bear_bar:
+                ck = f"{symbol}|{period_label}|持續跳空下|{bar_date}"
+                if ck not in st.session_state.sent_alerts:
+                    st.session_state.sent_alerts.add(ck)
+                    if is_latest:
+                        _brk_pct = (p_low - b_low) / p_low * 100
+                        _f9_msg = (f"🚨🚨 【F9·持續跳空(下)】跳空-{gap_dn_pct:.2f}%"
+                                   f" 今低{b_low:.2f}<前低{p_low:.2f}（破底{_brk_pct:.2f}%）"
+                                   f" 陰線確認 量×{vol_ratio:.1f}"
+                                   f"｜10年回測隔日收低率99%（n=105）"
+                                   f"，空頭持續延伸破底，強烈做空！")
+                        add_alert(symbol, period_label, _f9_msg, "bear")
+                        new_signals.append(f"F9-持續跳空下空頭{gap_dn_pct:.1f}%")
+                        generate_trade_suggestion(symbol, period_label, f"F9-持續跳空下空頭{gap_dn_pct:.1f}%",
+                                                  "bear", b_close, atr_val)
 
         # ── F4. 缺口回補測試（固定看最新根）─────────────────────────────────
         curr_low = float(low.iloc[-1])
@@ -3326,6 +6051,13 @@ def run_alerts(symbol, period_label, df, trigger_ai=False, mkt=None):
                                   f"，突破盤整高點{_g7_range_high:.2f}"
                                   f"，蓄力越久爆發越猛，趨勢啟動！", "bull")
                         new_signals.append(f"長盤整×{_g7_tight_bars}爆量×{_g7_vol_x:.0f}突破")
+                        conf = min(95, 60 + _g7_tight_bars//2 + int(_g7_vol_x)*2)
+                        tl_log_decision(symbol, period_label, "G7",
+                                        triggered=True, signal_type="bull",
+                                        reason=f"長盤整{_g7_tight_bars}根後爆量{_g7_vol_x:.1f}×突破高點{_g7_range_high:.2f}",
+                                        confidence=min(conf, 95),
+                                        key_values={"盤整根數": _g7_tight_bars, "量能倍數": f"{_g7_vol_x:.1f}x",
+                                                    "陽線漲幅": f"{_g7_bar_pct:+.2f}%", "突破高點": _g7_range_high})
 
                 # 空頭版：長盤整後放量跌破
                 elif (_g7_tight_pct >= 0.6 and _g7_tight_bars >= 15
@@ -3413,10 +6145,15 @@ def run_alerts(symbol, period_label, df, trigger_ai=False, mkt=None):
     # I. MACD 背離偵測（底背離/頂背離）
     # ══════════════════════════════════════════════════════════════════════════
     try:
-        if len(close) >= 40:
+        # 依時間週期動態調整窗口：日K兩個頂可能相距60根，分鐘級40根就夠
+        _i_window = 80 if any(x in period_label for x in ["日","1d","wk","mo","月","週","季","年"]) else 40
+        _i_since_max = 40 if any(x in period_label for x in ["日","1d","wk","mo","月","週","季","年"]) else 20
+
+        if len(close) >= _i_window // 2:
             _dif_i, _dea_i, _ = calc_macd(close)
-            _c40   = close.iloc[-40:]
-            _dif40 = _dif_i.iloc[-40:]
+            _n = min(_i_window, len(close))
+            _cN   = close.iloc[-_n:]
+            _difN = _dif_i.iloc[-_n:]
 
             def _find_lows(series):
                 vals = list(series.values)
@@ -3449,13 +6186,13 @@ def run_alerts(symbol, period_label, df, trigger_ai=False, mkt=None):
                 return merged[-2:] if len(merged) >= 2 else []
 
             # ── I1. MACD 底背離 ──────────────────────────────────────────────
-            _pl = _find_lows(_c40)
+            _pl = _find_lows(_cN)
             if len(_pl) >= 2:
-                _p1 = float(_c40.iloc[_pl[-2]]); _p2 = float(_c40.iloc[_pl[-1]])
-                _d1 = float(_dif40.iloc[_pl[-2]]); _d2 = float(_dif40.iloc[_pl[-1]])
-                _since = 39 - _pl[-1]
+                _p1 = float(_cN.iloc[_pl[-2]]); _p2 = float(_cN.iloc[_pl[-1]])
+                _d1 = float(_difN.iloc[_pl[-2]]); _d2 = float(_difN.iloc[_pl[-1]])
+                _since = (_n-1) - _pl[-1]
                 _dif_rising = float(_dif_i.iloc[-1]) > float(_dif_i.iloc[-1-min(3,len(_dif_i)-1)])
-                if (_p2 < _p1*0.9995 and _d2 > _d1*1.01 and _dif_rising and _since <= 20):
+                if (_p2 < _p1*0.9995 and _d2 > _d1*1.01 and _dif_rising and _since <= _i_since_max):
                     ck = f"{symbol}|{period_label}|MACD底背離|{df.index[-1].strftime('%Y%m%d%H') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:13]}"
                     if ck not in st.session_state.sent_alerts:
                         st.session_state.sent_alerts.add(ck)
@@ -3466,21 +6203,71 @@ def run_alerts(symbol, period_label, df, trigger_ai=False, mkt=None):
                         new_signals.append("MACD底背離")
 
             # ── I2. MACD 頂背離 ──────────────────────────────────────────────
-            _ph = _find_highs(_c40)
+            _ph = _find_highs(_cN)
             if len(_ph) >= 2:
-                _p1 = float(_c40.iloc[_ph[-2]]); _p2 = float(_c40.iloc[_ph[-1]])
-                _d1 = float(_dif40.iloc[_ph[-2]]); _d2 = float(_dif40.iloc[_ph[-1]])
-                _since = 39 - _ph[-1]
+                _p1 = float(_cN.iloc[_ph[-2]]); _p2 = float(_cN.iloc[_ph[-1]])
+                _d1 = float(_difN.iloc[_ph[-2]]); _d2 = float(_difN.iloc[_ph[-1]])
+                _since = (_n-1) - _ph[-1]
                 _dif_falling = float(_dif_i.iloc[-1]) < float(_dif_i.iloc[-1-min(3,len(_dif_i)-1)])
-                if (_p2 > _p1*1.0005 and _d2 < _d1*0.99 and _dif_falling and _since <= 20):
+                # 頂背離強度：DIF差距越大越可靠
+                _div_strength = (_d1 - _d2) / abs(_d1) * 100 if _d1 != 0 else 0
+                if (_p2 > _p1*1.0005 and _d2 < _d1*0.99 and _dif_falling and _since <= _i_since_max):
                     ck = f"{symbol}|{period_label}|MACD頂背離|{df.index[-1].strftime('%Y%m%d%H') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:13]}"
                     if ck not in st.session_state.sent_alerts:
                         st.session_state.sent_alerts.add(ck)
+                        if _div_strength > 50:
+                            _div_grade = "🚨 極強頂背離"
+                        elif _div_strength > 25:
+                            _div_grade = "⚠️ 強頂背離"
+                        else:
+                            _div_grade = "📉 頂背離"
                         add_alert(symbol, period_label,
-                                  f"📉 【MACD頂背離】價格創新高({_p1:.2f}→{_p2:.2f})"
-                                  f" 但DIF未創新高({_d1:.3f}→{_d2:.3f})"
-                                  f"，多頭動能衰竭，注意回落風險！", "bear")
-                        new_signals.append("MACD頂背離")
+                                  f"{_div_grade}｜價格創新高({_p1:.2f}→{_p2:.2f}，+{(_p2-_p1)/_p1*100:.1f}%)"
+                                  f" 但DIF大幅衰退({_d1:.2f}→{_d2:.2f}，-{_div_strength:.0f}%)"
+                                  f"，多頭動能嚴重衰竭，頂部反轉風險極高！", "bear")
+                        new_signals.append(f"MACD頂背離DIF衰退{_div_strength:.0f}%")
+                        tl_log_decision(symbol, period_label, "I2",
+                                        triggered=True, signal_type="bear",
+                                        reason=f"頂背離：價格{_p1:.2f}→{_p2:.2f}，DIF {_d1:.2f}→{_d2:.2f} 衰退{_div_strength:.0f}%",
+                                        confidence=min(50 + int(_div_strength//2), 95),
+                                        key_values={"高點1價格": _p1, "高點2價格": _p2,
+                                                    "DIF高點1": round(_d1,2), "DIF高點2": round(_d2,2),
+                                                    "DIF衰退": f"{_div_strength:.0f}%"})
+
+            # ── I3. 絕對高點背離（圖中最典型：498創新高但DIF遠低於歷史峰值）──
+            # 適用於跨週期頂背離：用全局DIF峰值比較，不依賴局部高點匹配
+            if len(close) >= 30:
+                _dif_all_max = float(_dif_i.iloc[:-5].max())   # 歷史DIF峰值（排除最近5根）
+                _dif_cur     = float(_dif_i.iloc[-1])
+                _price_cur   = float(close.iloc[-1])
+                _price_max_n = float(close.iloc[-_n:].max())   # 近N根價格最高
+                _dif_at_peak_bar = int(_dif_i.iloc[:-5].values.argmax())  # DIF峰值所在的bar
+                _price_at_dif_peak = float(close.iloc[_dif_at_peak_bar])  # DIF峰值時的價格
+
+                # 條件：當前價格接近歷史最高，但DIF遠低於歷史峰值
+                _price_near_high  = _price_cur >= _price_max_n * 0.85    # 在最高點85%以內（放寬）
+                _dif_far_below    = _dif_cur < _dif_all_max * 0.60       # DIF不足峰值60%
+                _dif_declining    = _dif_cur < float(_dif_i.iloc[-5])    # DIF仍在下降
+                _dif_was_positive = _dif_all_max > 1.0                   # 確認有過明顯升浪
+
+                if (_price_near_high and _dif_far_below
+                        and _dif_declining and _dif_was_positive):
+                    _decay_pct = (1 - _dif_cur / _dif_all_max) * 100
+                    ck = f"{symbol}|{period_label}|MACD絕對頂背離|{df.index[-1].strftime('%Y%m%d') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:10]}"
+                    if ck not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(ck)
+                        if _decay_pct > 70:
+                            _i3_grade = "🚨 極端頂背離"
+                        elif _decay_pct > 50:
+                            _i3_grade = "⚠️ 嚴重頂背離"
+                        else:
+                            _i3_grade = "📉 頂背離"
+                        add_alert(symbol, period_label,
+                                  f"{_i3_grade}｜價格在高位({_price_cur:.2f}，近高{_price_max_n:.2f}的{_price_cur/_price_max_n*100:.0f}%)"
+                                  f" 但DIF僅剩歷史峰值的{100-_decay_pct:.0f}%"
+                                  f"（峰值DIF={_dif_all_max:.2f}→當前={_dif_cur:.2f}，衰退{_decay_pct:.0f}%）"
+                                  f"，多頭動能嚴重透支，大頂風險極高！", "bear")
+                        new_signals.append(f"絕對頂背離DIF僅剩{100-_decay_pct:.0f}%")
 
     except Exception:
         pass
@@ -3769,13 +6556,1030 @@ def run_alerts(symbol, period_label, df, trigger_ai=False, mkt=None):
                               f"，市場進入恐慌模式，所有多單注意風控！", "bear")
                     new_signals.append(f"VIX極端恐慌{_vix_spot:.0f}")
 
+            # ── L5. VIX 絕對水平警戒區（無論漲跌，水平本身就有意義）─────────
+            # 圖中 VIX=25.66 已進入高恐慌區（>25），TSLA 對應跌到 399 區
+            _vix_zone_ck = f"{symbol}|{period_label}|VIX水平警戒|{df.index[-1].strftime('%Y%m%d') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:10]}"
+            if _vix_zone_ck not in st.session_state.sent_alerts:
+                if _vix_spot >= 30:
+                    st.session_state.sent_alerts.add(_vix_zone_ck)
+                    add_alert(symbol, period_label,
+                              f"🚨 【VIX極度恐慌區】VIX={_vix_spot:.1f} ≥30"
+                              f"，歷史上此水平對應市場重大下跌，極端謹慎！", "bear")
+                    new_signals.append(f"VIX極度恐慌≥30")
+                elif _vix_spot >= 25:
+                    st.session_state.sent_alerts.add(_vix_zone_ck)
+                    add_alert(symbol, period_label,
+                              f"⚠️ 【VIX高恐慌區】VIX={_vix_spot:.1f} 介於25-30"
+                              f"，市場恐慌情緒明顯，股票下行壓力大，謹慎持多！", "bear")
+                    new_signals.append(f"VIX高恐慌25-30")
+                elif _vix_spot <= 13:
+                    st.session_state.sent_alerts.add(_vix_zone_ck)
+                    add_alert(symbol, period_label,
+                              f"📊 【VIX極低參考】VIX={_vix_spot:.1f} ≤13"
+                              f"，市場樂觀但回測顯示此區間隔日收高率僅40.6%（低於隨機）"
+                              f"，過度樂觀易反轉，謹慎追多！", "info")
+                    new_signals.append(f"VIX極低謹慎≤13")
+
+            # ── L6. VIX 盤中急升偵測（當日漲幅，圖中3/6當天+28%場景）─────────
+            # chg_pct_from_prev 是相對前日收盤的變化
+            _vix_intraday_surge = abs(_vix_pct) > 15  # 當日漲跌超15%
+            if _vix_intraday_surge:
+                _surge_ck = f"{symbol}|{period_label}|VIX盤中急升|{_ts}"
+                if _surge_ck not in st.session_state.sent_alerts:
+                    st.session_state.sent_alerts.add(_surge_ck)
+                    if _vix_pct > 15:   # 急升→股市恐慌
+                        add_alert(symbol, period_label,
+                                  f"🚨 【VIX盤中暴升{_vix_pct:+.0f}%】VIX={_vix_spot:.1f}"
+                                  f"，單日恐慌指數暴增，可能對應股市急跌！"
+                                  f"（參考：股價近期低位{_lp_low20:.2f}）", "bear")
+                        new_signals.append(f"VIX盤中暴升{_vix_pct:.0f}%")
+                    else:               # 急跌→恐慌消退
+                        add_alert(symbol, period_label,
+                                  f"🚀 【VIX盤中暴跌{_vix_pct:.0f}%】VIX={_vix_spot:.1f}"
+                                  f"，恐慌指數單日大幅消退，股市反彈機率大！", "bull")
+                        new_signals.append(f"VIX盤中暴跌{_vix_pct:.0f}%")
+
+            # ── L7. VIX 多日趨勢偵測（日K視角：圖中從15→23.76持續上升）────────
+            try:
+                _vix_hist = fetch_vix_history()
+                if len(_vix_hist) >= 10:
+                    _vh = _vix_hist.values
+                    _vh_now  = float(_vh[-1])
+                    _vh_5d   = float(_vh[-5])    # 5日前
+                    _vh_10d  = float(_vh[-10])   # 10日前
+                    _vh_low  = float(min(_vh[-20:]))  # 近20日最低
+                    _vh_high = float(max(_vh[-20:]))  # 近20日最高
+
+                    # 多日累計升幅
+                    _vix_5d_chg  = (_vh_now - _vh_5d)  / _vh_5d  * 100
+                    _vix_10d_chg = (_vh_now - _vh_10d) / _vh_10d * 100
+
+                    # 位置：在近20日區間的百分位
+                    _vix_pos = (_vh_now - _vh_low) / (_vh_high - _vh_low) * 100 if _vh_high > _vh_low else 50
+
+                    _ts_day = df.index[-1].strftime('%Y%m%d') if hasattr(df.index[-1], 'strftime') else str(df.index[-1])[:10]
+
+                    # VIX 多日持續上升（系統性風險積累）
+                    if _vix_5d_chg > 15 and _vix_10d_chg > 20:
+                        _ck7 = f"{symbol}|{period_label}|VIX多日上升趨勢|{_ts_day}"
+                        if _ck7 not in st.session_state.sent_alerts:
+                            st.session_state.sent_alerts.add(_ck7)
+                            if _vix_10d_chg > 40:
+                                _v7g = "🚨 系統性風險警報"
+                            elif _vix_10d_chg > 25:
+                                _v7g = "⚠️ 風險持續累積"
+                            else:
+                                _v7g = "📊 恐慌升溫"
+                            add_alert(symbol, period_label,
+                                      f"{_v7g}｜VIX 5日+{_vix_5d_chg:.0f}%、10日+{_vix_10d_chg:.0f}%"
+                                      f"（{_vh_10d:.1f}→{_vh_now:.1f}）"
+                                      f"，恐慌情緒持續累積，非短期波動！"
+                                      f"（VIX在近20日{_vix_pos:.0f}%分位）", "bear")
+                            new_signals.append(f"VIX多日升{_vix_10d_chg:.0f}%")
+
+                    # VIX 多日持續下降（系統性風險消退，利多）
+                    elif _vix_5d_chg < -15 and _vix_10d_chg < -20:
+                        _ck7 = f"{symbol}|{period_label}|VIX多日下降趨勢|{_ts_day}"
+                        if _ck7 not in st.session_state.sent_alerts:
+                            st.session_state.sent_alerts.add(_ck7)
+                            add_alert(symbol, period_label,
+                                      f"📈 【恐慌持續消退】VIX 5日{_vix_5d_chg:.0f}%、10日{_vix_10d_chg:.0f}%"
+                                      f"（{_vh_10d:.1f}→{_vh_now:.1f}）"
+                                      f"，市場風險持續下降，有利股市上漲！", "bull")
+                            new_signals.append(f"VIX多日降{_vix_10d_chg:.0f}%")
+
+                    # VIX 處於近期高位且未回落（壓頂）
+                    if _vix_pos > 80 and _vh_now > 20:
+                        _ck7b = f"{symbol}|{period_label}|VIX近期高位壓頂|{_ts_day}"
+                        if _ck7b not in st.session_state.sent_alerts:
+                            st.session_state.sent_alerts.add(_ck7b)
+                            add_alert(symbol, period_label,
+                                      f"⚠️ 【VIX近期高位壓頂】VIX={_vh_now:.1f} 處於20日{_vix_pos:.0f}%分位"
+                                      f"（近期低{_vh_low:.1f} 高{_vh_high:.1f}）"
+                                      f"，恐慌未消退，股市反彈空間受限！", "bear")
+                            new_signals.append(f"VIX高位壓頂{_vh_now:.0f}")
+            except Exception:
+                pass
+
     except Exception:
         pass
 
-    # ── 有新信號 → 自動觸發 AI 分析 ──────────────────────────────────────────
-    if not new_signals or not trigger_ai:
-        return
-    if not get_groq_key():
+    # ══════════════════════════════════════════════════════════════════════════
+    # M. ADX 趨勢強度 + Williams %R 超買超賣偵測
+    # ══════════════════════════════════════════════════════════════════════════
+    try:
+        if len(df) >= 20 and "High" in df.columns and "Low" in df.columns:
+            _adx, _pdi, _ndi = calc_adx(df, 14)
+            _willr = calc_willr(df, 14)
+
+            _adx_v  = float(_adx.iloc[-1])  if not np.isnan(float(_adx.iloc[-1]))  else None
+            _pdi_v  = float(_pdi.iloc[-1])  if not np.isnan(float(_pdi.iloc[-1]))  else None
+            _ndi_v  = float(_ndi.iloc[-1])  if not np.isnan(float(_ndi.iloc[-1]))  else None
+            _wr_v   = float(_willr.iloc[-1]) if not np.isnan(float(_willr.iloc[-1])) else None
+            _wr_p   = float(_willr.iloc[-2]) if len(_willr)>=2 and not np.isnan(float(_willr.iloc[-2])) else _wr_v
+            _adx_p  = float(_adx.iloc[-2])  if len(_adx)>=2  and not np.isnan(float(_adx.iloc[-2]))  else _adx_v
+
+            _ts = df.index[-1].strftime('%Y%m%d%H') if hasattr(df.index[-1], 'strftime') else str(df.index[-1])[:13]
+
+            # ── M1. ADX 空頭趨勢確認（-DI>+DI 且 ADX>25）────────────────────
+            if _adx_v and _pdi_v and _ndi_v:
+                _bear_trend = _ndi_v > _pdi_v and _adx_v > 25
+                _bull_trend = _pdi_v > _ndi_v and _adx_v > 25
+                _adx_rising = _adx_v > _adx_p if _adx_p else False
+
+                if _bear_trend:
+                    ck = f"{symbol}|{period_label}|ADX空頭趨勢|{_ts}"
+                    if ck not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(ck)
+                        _strength = "強烈" if _adx_v > 35 else "有效" if _adx_v > 25 else "醞釀中"
+                        add_alert(symbol, period_label,
+                                  f"💀 【ADX空頭趨勢{_strength}】ADX={_adx_v:.1f}"
+                                  f"，-DI({_ndi_v:.1f})>+DI({_pdi_v:.1f})空頭主導"
+                                  f"{'，ADX上升趨勢加強中！' if _adx_rising else '，ADX持平趨勢穩定。'}", "bear")
+                        new_signals.append(f"ADX空頭{_adx_v:.0f}-DI>{_pdi_v:.0f}")
+
+                elif _bull_trend:
+                    ck = f"{symbol}|{period_label}|ADX多頭趨勢|{_ts}"
+                    if ck not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(ck)
+                        _strength = "強烈" if _adx_v > 35 else "有效"
+                        add_alert(symbol, period_label,
+                                  f"🚀 【ADX多頭趨勢{_strength}】ADX={_adx_v:.1f}"
+                                  f"，+DI({_pdi_v:.1f})>-DI({_ndi_v:.1f})多頭主導"
+                                  f"{'，ADX上升趨勢加強！' if _adx_rising else '。'}", "bull")
+                        new_signals.append(f"ADX多頭{_adx_v:.0f}+DI>{_ndi_v:.0f}")
+
+                # ── M2. DI 交叉（方向轉換最早期訊號）────────────────────────
+                _pdi_p = float(_pdi.iloc[-2]) if len(_pdi)>=2 else _pdi_v
+                _ndi_p = float(_ndi.iloc[-2]) if len(_ndi)>=2 else _ndi_v
+                _bull_cross = _pdi_v > _ndi_v and _pdi_p <= _ndi_p   # +DI上穿-DI
+                _bear_cross = _ndi_v > _pdi_v and _ndi_p <= _pdi_p   # -DI上穿+DI
+
+                if _bull_cross:
+                    ck = f"{symbol}|{period_label}|DI多頭交叉|{_ts}"
+                    if ck not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(ck)
+                        add_alert(symbol, period_label,
+                                  f"📈 【DI多頭交叉】+DI({_pdi_v:.1f}) 上穿 -DI({_ndi_v:.1f})"
+                                  f"，方向由空轉多，趨勢反轉訊號！ADX={_adx_v:.1f}", "bull")
+                        new_signals.append(f"DI多頭交叉")
+
+                elif _bear_cross:
+                    ck = f"{symbol}|{period_label}|DI空頭交叉|{_ts}"
+                    if ck not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(ck)
+                        add_alert(symbol, period_label,
+                                  f"📉 【DI空頭交叉】-DI({_ndi_v:.1f}) 上穿 +DI({_pdi_v:.1f})"
+                                  f"，方向由多轉空，趨勢反轉訊號！ADX={_adx_v:.1f}", "bear")
+                        new_signals.append(f"DI空頭交叉")
+
+            # ── M3. Williams %R 超買/超賣偵測 ────────────────────────────────
+            if _wr_v is not None:
+                # 超賣回升穿越-80（底部反彈訊號）
+                if _wr_p is not None and _wr_p < -80 and _wr_v >= -80:
+                    ck = f"{symbol}|{period_label}|WR超賣回升|{_ts}"
+                    if ck not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(ck)
+                        add_alert(symbol, period_label,
+                                  f"🟢 【Williams %R超賣回升】WR穿越-80({_wr_v:.1f})"
+                                  f"，從超賣區反彈，潛在底部買入機會！", "bull")
+                        new_signals.append(f"WR超賣回升{_wr_v:.0f}")
+
+                # 超買回落穿越-20（頂部回落訊號）
+                elif _wr_p is not None and _wr_p > -20 and _wr_v <= -20:
+                    ck = f"{symbol}|{period_label}|WR超買回落|{_ts}"
+                    if ck not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(ck)
+                        add_alert(symbol, period_label,
+                                  f"🔴 【Williams %R超買回落】WR穿越-20({_wr_v:.1f})"
+                                  f"，從超買區回落，潛在頂部賣出訊號！", "bear")
+                        new_signals.append(f"WR超買回落{_wr_v:.0f}")
+
+                # 持續在超賣區（-80以下）且開始回升
+                elif _wr_v < -80 and _wr_p is not None and _wr_v > _wr_p:
+                    ck = f"{symbol}|{period_label}|WR深度超賣回升|{_ts}"
+                    if ck not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(ck)
+                        add_alert(symbol, period_label,
+                                  f"💡 【Williams %R深度超賣】WR={_wr_v:.1f}(<-80)"
+                                  f" 且開始回升，極度超賣反彈機率高！", "bull")
+                        new_signals.append(f"WR深度超賣{_wr_v:.0f}")
+
+                # M4. ADX+WR 組合：趨勢有效 + 未到超賣（圖中當前狀態：ADX=25，WR=-47）
+                # 含義：空頭趨勢有效，但WR還在中間，跌勢可能繼續
+                if (_adx_v and _ndi_v and _pdi_v
+                        and _adx_v > 25 and _ndi_v > _pdi_v    # 有效空頭趨勢
+                        and -80 < _wr_v < -20):                  # WR中性（未超賣）
+                    ck = f"{symbol}|{period_label}|ADX空趨勢WR中性|{_ts}"
+                    if ck not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(ck)
+                        add_alert(symbol, period_label,
+                                  f"⚠️ 【空頭趨勢仍有空間】ADX={_adx_v:.1f}空頭有效"
+                                  f"，WR={_wr_v:.1f} 尚未達超賣區(-80)"
+                                  f"，下跌動能未耗盡，暫不宜抄底！", "bear")
+                        new_signals.append(f"ADX空頭WR中性{_wr_v:.0f}")
+
+    except Exception:
+        pass
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # N. 三大策略形態偵測
+    #    N1. ORB 開盤區間突破（Phase A→B→C→D）
+    #    N2. Consolidation 回測支撐再進場（圖1步驟5）
+    #    N3. Key Level 強度評分（多次反彈+強烈反應）
+    # ══════════════════════════════════════════════════════════════════════════
+    try:
+        _n_price = float(close.iloc[-1])
+        _n_open  = float(df["Open"].iloc[-1])   if "Open"  in df.columns else _n_price
+        _n_high  = float(df["High"].iloc[-1])   if "High"  in df.columns else _n_price
+        _n_low   = float(df["Low"].iloc[-1])    if "Low"   in df.columns else _n_price
+        _n_ts    = df.index[-1].strftime('%Y%m%d%H') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:13]
+
+        # ── N1. ORB 開盤區間突破（僅限分鐘級時間週期）──────────────────────
+        _is_intraday = any(x in period_label for x in ["1分","5分","15分","30分","1m","5m","15m","30m"])
+        if _is_intraday and len(df) >= 10 and "High" in df.columns:
+            # 取當日前6根5分鐘K（=開盤30分鐘）計算 ORB
+            try:
+                _today_idx = df.index[-1].date() if hasattr(df.index[-1], 'date') else None
+                if _today_idx:
+                    _today_bars = df[df.index.date == _today_idx] if hasattr(df.index, 'date') else df.iloc[-40:]
+                    _orb_bars   = _today_bars.iloc[:6]   # 前6根 = 開盤30分鐘（5m週期）
+                    if len(_orb_bars) >= 3:
+                        _orb_hi = float(_orb_bars["High"].max())
+                        _orb_lo = float(_orb_bars["Low"].min())
+                        _orb_rng = _orb_hi - _orb_lo
+
+                        # Phase B：當前突破 ORB 高點
+                        _orb_breakout_up   = _n_price > _orb_hi * 1.002
+                        _orb_breakout_down = _n_price < _orb_lo * 0.998
+
+                        # Phase C：突破後回測守住（在ORB高點上方0-1.5%）
+                        # 需要：前幾根已突破，當前根回測但收在 ORB 高點附近
+                        _prev_max = float(df["High"].iloc[-6:-1].max()) if len(df) >= 6 else _n_price
+                        _prev_min = float(df["Low"].iloc[-6:-1].min())  if len(df) >= 6 else _n_price
+                        _prev_broke_hi = _prev_max > _orb_hi * 1.003   # 之前已突破
+                        _prev_broke_lo = _prev_min < _orb_lo * 0.997   # 之前已跌破
+
+                        _retest_hi_hold = (_prev_broke_hi and                           # 之前突破過
+                                           _n_low <= _orb_hi * 1.008 and               # 當根回測到 ORB 附近
+                                           _n_price >= _orb_hi * 0.998 and             # 但收盤守住
+                                           _n_price > _n_open)                          # 陽線收
+
+                        _retest_lo_hold = (_prev_broke_lo and
+                                           _n_high >= _orb_lo * 0.992 and
+                                           _n_price <= _orb_lo * 1.002 and
+                                           _n_price < _n_open)
+
+                        if _retest_hi_hold:
+                            ck = f"{symbol}|{period_label}|ORB回測支撐|{_n_ts}"
+                            if ck not in st.session_state.sent_alerts:
+                                st.session_state.sent_alerts.add(ck)
+                                add_alert(symbol, period_label,
+                                          f"🎯 【ORB Phase C 進場信號】突破開盤區間高點{_orb_hi:.2f}"
+                                          f"後回測守住，陽線確認支撐"
+                                          f"，目標看 Phase D 新高！"
+                                          f"（ORB區間{_orb_lo:.2f}-{_orb_hi:.2f}，寬度{_orb_rng:.2f}）"
+                                          f"　止損設於ORB低點{_orb_lo:.2f}以下", "bull")
+                                new_signals.append(f"ORB突破回測買入{_orb_hi:.2f}")
+                                tl_log_decision(symbol, period_label, "N1-ORB",
+                                                triggered=True, signal_type="bull",
+                                                reason=f"Phase C：突破{_orb_hi:.2f}後回測守住，陽線收盤",
+                                                confidence=75,
+                                                key_values={"ORB高": _orb_hi, "ORB低": _orb_lo,
+                                                            "區間寬度": round(_orb_rng,2), "當前": _n_price})
+
+                        elif _retest_lo_hold:
+                            ck = f"{symbol}|{period_label}|ORB跌破回測|{_n_ts}"
+                            if ck not in st.session_state.sent_alerts:
+                                st.session_state.sent_alerts.add(ck)
+                                add_alert(symbol, period_label,
+                                          f"📉 【ORB跌破回測做空】跌破開盤區間低點{_orb_lo:.2f}"
+                                          f"後反彈回測但守不住，陰線確認"
+                                          f"，看空目標！止損設於ORB高點{_orb_hi:.2f}以上", "bear")
+                                new_signals.append(f"ORB跌破回測做空{_orb_lo:.2f}")
+
+            except Exception:
+                pass
+
+        # ── N2. Consolidation 突破後回測支撐進場（圖1步驟5）──────────────────
+        # 邏輯：G7 檢測到盤整突破（多根前），現在回測到突破點附近，守住→進場
+        if len(close) >= 20:
+            _n2_window = 25
+            _n2_c  = close.iloc[-_n2_window:]
+            _n2_hi = float(_n2_c.max())           # 盤整突破後的最高點
+            _n2_range_hi = float(close.iloc[-_n2_window:-8].max())  # 排除最近8根（突破後的上漲段）
+
+            # 當前在突破點附近（距突破頂±0.5%）
+            _n2_near_breakout  = abs(_n_price - _n2_range_hi) / _n2_range_hi < 0.005
+            # 之前有過突破（5根前的最高點 > 更之前的盤整頂）
+            _n2_broke = _n2_hi > _n2_range_hi * 1.008
+            # 當前陽線（守住支撐）
+            _n2_bull_bar = _n_price > _n_open and _n_price >= _n2_range_hi * 0.998
+
+            # 量能縮小（回測時量小是好事）
+            _n2_vol_now  = float(vol.iloc[-1])
+            _n2_vol_prev = float(vol.iloc[-6:-1].mean()) if len(vol) >= 6 else _n2_vol_now
+            _n2_low_vol  = _n2_vol_now < _n2_vol_prev * 0.7  # 回測量縮
+
+            if _n2_broke and _n2_near_breakout and _n2_bull_bar:
+                ck = f"{symbol}|{period_label}|整理突破回測|{_n_ts}"
+                if ck not in st.session_state.sent_alerts:
+                    st.session_state.sent_alerts.add(ck)
+                    vol_note = "（縮量回測更佳✅）" if _n2_low_vol else ""
+                    add_alert(symbol, period_label,
+                              f"🎯 【整理突破回測買點】價格突破盤整頂{_n2_range_hi:.2f}後"
+                              f"回測守住{vol_note}"
+                              f"，陽線確認支撐，圖1策略步驟5進場！"
+                              f"　止損設於{_n2_range_hi * 0.995:.2f}以下", "bull")
+                    new_signals.append(f"整理突破回測{_n2_range_hi:.2f}")
+                    tl_log_decision(symbol, period_label, "N2-Consolidation",
+                                    triggered=True, signal_type="bull",
+                                    reason=f"突破{_n2_range_hi:.2f}後回測守住，{'縮量' if _n2_low_vol else '量正常'}",
+                                    confidence=70 + (10 if _n2_low_vol else 0),
+                                    key_values={"突破頂": _n2_range_hi, "當前": _n_price,
+                                                "距突破頂": f"{(_n_price-_n2_range_hi)/_n2_range_hi*100:+.2f}%",
+                                                "縮量": _n2_low_vol})
+
+        # ── N3. Key Level 強度評分（圖3：多次反彈+強烈反應）──────────────────
+        if len(close) >= 30 and "High" in df.columns:
+            _n3_lookback = min(60, len(close))
+            _n3_c  = close.iloc[-_n3_lookback:]
+            _n3_hi = df["High"].iloc[-_n3_lookback:]
+            _n3_lo = df["Low"].iloc[-_n3_lookback:]
+
+            # 自動找關鍵水平（用近60根的最高頻率價格區間）
+            _n3_vals  = _n3_c.values
+            _n3_all   = np.concatenate([_n3_vals, _n3_hi.values, _n3_lo.values])
+            _n3_p10   = np.percentile(_n3_all, 10)   # 支撐帶低
+            _n3_p90   = np.percentile(_n3_all, 90)   # 阻力帶高
+
+            # 對每個候選水平評分（每次測試的反應幅度）
+            def _key_level_score(level_price, tolerance=0.005):
+                touches = 0; strong_reactions = 0
+                n3_len = len(_n3_vals)
+                for i in range(n3_len):
+                    lo_i = float(_n3_lo.iloc[i]); hi_i = float(_n3_hi.iloc[i])
+                    cl_i = float(_n3_c.iloc[i])
+                    # 觸及此水平（低點或高點在容忍範圍內）
+                    if abs(lo_i - level_price)/level_price < tolerance or \
+                       abs(hi_i - level_price)/level_price < tolerance:
+                        touches += 1
+                        # 強烈反應：觸及後下一根的價格變動超過0.3%（圖3：Strong Reaction）
+                        if i + 1 < n3_len:
+                            next_cl  = float(_n3_c.iloc[i+1])
+                            reaction = abs(next_cl - cl_i) / level_price * 100
+                            if reaction > 0.3: strong_reactions += 1
+                        # 或當根K線本身寬度超過0.6%（長影線強烈反應）
+                        elif (hi_i - lo_i) / level_price * 100 > 0.6:
+                            strong_reactions += 1
+                return touches, strong_reactions
+
+            # 當前價格附近±2%的支撐/阻力評分
+            for _lv_offset in [-0.008, -0.004, 0, 0.004, 0.008]:
+                _lv = _n_price * (1 + _lv_offset)
+                _lv_touches, _lv_strong = _key_level_score(_lv)
+
+                # 圖3標準：≥3次觸及 + ≥2次強烈反應
+                if _lv_touches >= 3 and _lv_strong >= 2:
+                    _lv_type  = "支撐" if _lv < _n_price else "阻力" if _lv > _n_price else "當前關鍵位"
+                    _lv_grade = "🔑🔑 極強" if _lv_touches >= 5 else "🔑 強"
+                    ck = f"{symbol}|{period_label}|關鍵水平{_lv:.2f}|{_n_ts[:10]}"
+                    if ck not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(ck)
+                        add_alert(symbol, period_label,
+                                  f"{_lv_grade}關鍵{_lv_type}位 {_lv:.2f}"
+                                  f"（{_lv_touches}次測試，{_lv_strong}次強烈反應）"
+                                  f"，符合圖3 Key Level 3項標準！"
+                                  f"　當前距此水平{(_n_price-_lv)/_lv*100:+.2f}%",
+                                  "bull" if _lv < _n_price else "bear")
+                        new_signals.append(f"關鍵{_lv_type}位{_lv:.2f}×{_lv_touches}")
+                        tl_log_decision(symbol, period_label, "N3-KeyLevel",
+                                        triggered=True,
+                                        signal_type="bull" if _lv < _n_price else "bear",
+                                        reason=f"{_lv_type}位{_lv:.2f}：{_lv_touches}次觸及，{_lv_strong}次強烈反應",
+                                        confidence=min(50 + _lv_touches*8 + _lv_strong*5, 90),
+                                        key_values={"水平": round(_lv,2), "觸及次數": _lv_touches,
+                                                    "強烈反應": _lv_strong, "類型": _lv_type})
+                    break  # 只報最強的一個水平
+
+    except Exception:
+        pass
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # O. 多時間框架趨勢共振 + 下跌目標位預測
+    #    O1. MTF 多框架趨勢共振（日K+週K+月K同向 → 超強信號）
+    #    O2. 歷史回撤中位數預測目標支撐位
+    #    O3. 週K/月K 大週期空頭底背離預警（反轉準備信號）
+    # ══════════════════════════════════════════════════════════════════════════
+    try:
+        import yfinance as _yf_o
+        _o_price  = float(close.iloc[-1])
+        _o_ts_day = df.index[-1].strftime('%Y%m%d') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:10]
+
+        # ── O1. MTF 多時間框架趨勢共振 ────────────────────────────────────────
+        # 拉取日K、週K、月K，判斷各自 EMA5/20 的多空方向
+        @st.cache_data(ttl=300)
+        def _fetch_mtf_trend(sym):
+            result = {}
+            for iv, rng, label in [("1d","3mo","日K"), ("1wk","1y","週K"), ("1mo","5y","月K")]:
+                try:
+                    _df = _yf_o.download(sym, period=rng, interval=iv,
+                                         auto_adjust=True, progress=False)
+                    if _df.empty or len(_df) < 10: continue
+                    _df.columns = [c[0] if isinstance(c,tuple) else c for c in _df.columns]
+                    _c = _df["Close"].dropna()
+                    _e5  = float(_c.ewm(span=5,  adjust=False).mean().iloc[-1])
+                    _e20 = float(_c.ewm(span=20, adjust=False).mean().iloc[-1])
+                    _e60 = float(_c.ewm(span=60, adjust=False).mean().iloc[-1]) if len(_c)>=60 else None
+                    _price_last = float(_c.iloc[-1])
+                    # 趨勢：bull=EMA5>EMA20，bear=EMA5<EMA20
+                    direction = "bull" if _e5 > _e20 else "bear"
+                    # 相對EMA60位置（加分項）
+                    above_e60 = (_e5 > _e60) if _e60 else None
+                    result[label] = {
+                        "direction": direction,
+                        "e5": _e5, "e20": _e20,
+                        "price": _price_last,
+                        "above_e60": above_e60,
+                        "pct_from_e20": (_price_last - _e20) / _e20 * 100,
+                    }
+                except Exception:
+                    pass
+            return result
+
+        _mtf = _fetch_mtf_trend(symbol)
+
+        if len(_mtf) >= 2:
+            _bull_count = sum(1 for v in _mtf.values() if v["direction"] == "bull")
+            _bear_count = sum(1 for v in _mtf.values() if v["direction"] == "bear")
+            _frames_bear = [k for k,v in _mtf.items() if v["direction"] == "bear"]
+            _frames_bull = [k for k,v in _mtf.items() if v["direction"] == "bull"]
+
+            # 多框架全空頭共振（圖中週K空頭場景）
+            if _bear_count >= 2:
+                _o1_ck = f"{symbol}|{period_label}|MTF空頭共振|{_o_ts_day}"
+                if _o1_ck not in st.session_state.sent_alerts:
+                    st.session_state.sent_alerts.add(_o1_ck)
+                    _frame_detail = "　".join([
+                        f"{k}({'空' if v['direction']=='bear' else '多'}·距EMA20={v['pct_from_e20']:+.1f}%)"
+                        for k,v in _mtf.items()
+                    ])
+                    if _bear_count == 3:
+                        _o1_grade = "🚨 三框架全空頭"
+                        _o1_conf  = 90
+                    else:
+                        _o1_grade = "⚠️ 雙框架空頭共振"
+                        _o1_conf  = 72
+                    add_alert(symbol, period_label,
+                              f"{_o1_grade}｜{'+'.join(_frames_bear)}同時看空"
+                              f"（{_frame_detail}）"
+                              f"，多時間框架趨勢一致，下行動能最強！", "bear")
+                    new_signals.append(f"MTF{_bear_count}框架空頭共振")
+                    tl_log_decision(symbol, period_label, "O1-MTF",
+                                    triggered=True, signal_type="bear",
+                                    reason=f"{'+'.join(_frames_bear)}框架EMA5<EMA20空頭共振",
+                                    confidence=_o1_conf,
+                                    key_values={k: v["direction"] for k,v in _mtf.items()})
+
+            # 多框架全多頭共振
+            elif _bull_count >= 2:
+                _o1b_ck = f"{symbol}|{period_label}|MTF多頭共振|{_o_ts_day}"
+                if _o1b_ck not in st.session_state.sent_alerts:
+                    st.session_state.sent_alerts.add(_o1b_ck)
+                    _o1b_grade = "🚀🚀 三框架全多頭" if _bull_count == 3 else "🚀 雙框架多頭共振"
+                    add_alert(symbol, period_label,
+                              f"{_o1b_grade}｜{'+'.join(_frames_bull)}同時看多"
+                              f"，多時間框架趨勢共振，上行動能最強！", "bull")
+                    new_signals.append(f"MTF{_bull_count}框架多頭共振")
+
+        # ── O2. 歷史回撤分析 + 下跌目標位預測 ──────────────────────────────────
+        # 從近期高點計算合理的回撤目標（基於歷史回撤中位數）
+        if len(close) >= 30 and "High" in df.columns:
+            _o2_high = float(df["High"].iloc[-60:].max()) if len(df)>=60 else float(df["High"].max())
+            _o2_cur  = _o_price
+            _o2_from_top = (_o2_cur - _o2_high) / _o2_high * 100  # 已跌幅度
+
+            # 只在已從高點回落5%以上時計算目標
+            if _o2_from_top < -5:
+                # 用 ATR 估算波動率
+                if "Low" in df.columns:
+                    _atr_n = min(14, len(df)-1)
+                    _hi_s  = df["High"].iloc[-_atr_n:]
+                    _lo_s  = df["Low"].iloc[-_atr_n:]
+                    _cl_s  = close.iloc[-_atr_n-1:-1]
+                    _tr    = [max(float(_hi_s.iloc[i])-float(_lo_s.iloc[i]),
+                                  abs(float(_hi_s.iloc[i])-float(_cl_s.iloc[i])),
+                                  abs(float(_lo_s.iloc[i])-float(_cl_s.iloc[i])))
+                              for i in range(min(_atr_n, len(_hi_s), len(_lo_s), len(_cl_s)))]
+                    _atr   = sum(_tr) / len(_tr) if _tr else _o2_cur * 0.01
+
+                    # 目標位：黃金回撤（38.2%/50%/61.8%）從高點計算
+                    _fib_targets = {
+                        "38.2%回撤": _o2_high * (1 - 0.382 * abs(_o2_from_top/100) * (100/abs(_o2_from_top))),
+                        "50%回撤":   _o2_high * 0.50 if _o2_from_top < -30 else _o2_cur - _atr * 3,
+                        "ATR×3目標": _o2_cur - _atr * 3,
+                    }
+
+                    # 使用 EMA200 作為最強支撐目標
+                    if len(close) >= 200:
+                        _e200_target = float(calc_ema(close, 200).iloc[-1])
+                        _fib_targets["EMA200支撐"] = _e200_target
+
+                    _o2_ck = f"{symbol}|{period_label}|回撤目標分析|{_o_ts_day}"
+                    if _o2_ck not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(_o2_ck)
+                        _tgt_str = "　".join([
+                            f"{k}={v:.2f}（距今{(v-_o2_cur)/_o2_cur*100:+.1f}%）"
+                            for k,v in _fib_targets.items()
+                            if v < _o2_cur  # 只顯示在當前價格以下的目標
+                        ])
+                        if _tgt_str:
+                            add_alert(symbol, period_label,
+                                      f"📐 【回撤目標位分析】已從高點{_o2_high:.2f}下跌{_o2_from_top:.1f}%"
+                                      f"，技術目標支撐：{_tgt_str}"
+                                      f"　（ATR={_atr:.2f}，波動基準）", "bear")
+                            new_signals.append(f"回撤目標高點{_o2_high:.0f}已跌{_o2_from_top:.0f}%")
+
+        # ── O3. 週K/月K 大週期底背離預警（空頭末期反轉準備信號）─────────────
+        # 當日K已出現底背離（I1觸發），且週K RSI偏低 → 大週期反轉前兆
+        @st.cache_data(ttl=600)
+        def _fetch_weekly_rsi(sym):
+            try:
+                _df = _yf_o.download(sym, period="2y", interval="1wk",
+                                     auto_adjust=True, progress=False)
+                if _df.empty or len(_df) < 20: return None, None
+                _df.columns = [c[0] if isinstance(c,tuple) else c for c in _df.columns]
+                _c = _df["Close"].dropna()
+                delta = _c.diff()
+                gain  = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
+                loss  = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
+                rs    = gain / loss
+                rsi   = 100 - 100/(1+rs)
+                return float(rsi.iloc[-1]), float(rsi.iloc[-2])
+            except Exception:
+                return None, None
+
+        _w_rsi, _w_rsi_prev = _fetch_weekly_rsi(symbol)
+
+        if _w_rsi is not None:
+            _o3_ck = f"{symbol}|{period_label}|週K底背離預警|{_o_ts_day}"
+            # 週K RSI<40 且日K已有底背離信號（新信號列表中）
+            _has_daily_diverg = any("底背離" in s or "MACD深谷" in s for s in new_signals)
+            if _w_rsi < 40 and _o3_ck not in st.session_state.sent_alerts:
+                st.session_state.sent_alerts.add(_o3_ck)
+                _rsi_trend = "↑回升" if _w_rsi > _w_rsi_prev else "↓仍下行"
+                if _w_rsi < 30:
+                    _o3_grade = "🔔 週K超賣區"
+                    _o3_note  = "歷史上週K RSI<30 往往是大週期底部！"
+                elif _w_rsi < 35:
+                    _o3_grade = "📊 週K深度偏空"
+                    _o3_note  = "接近週K超賣，留意底部信號"
+                else:
+                    _o3_grade = "📊 週K偏空"
+                    _o3_note  = "週K趨勢仍偏空"
+
+                add_alert(symbol, period_label,
+                          f"{_o3_grade}｜週K RSI={_w_rsi:.1f}{_rsi_trend}"
+                          f"，{_o3_note}"
+                          f"{'　⚡日K已出現底背離，多框架共振底部！' if _has_daily_diverg else ''}"
+                          f"　（配合日K信號確認後再布局，勿搶底）",
+                          "bull" if _has_daily_diverg and _w_rsi < 35 else "info")
+                new_signals.append(f"週KRSI{_w_rsi:.0f}{'底部共振' if _has_daily_diverg else '偏空'}")
+                tl_log_decision(symbol, period_label, "O3-WeeklyRSI",
+                                triggered=True,
+                                signal_type="bull" if _has_daily_diverg and _w_rsi < 35 else "info",
+                                reason=f"週K RSI={_w_rsi:.1f}({'超賣' if _w_rsi<30 else '偏空'})"
+                                       f"{'，日K底背離共振' if _has_daily_diverg else ''}",
+                                confidence=55 + (20 if _has_daily_diverg else 0) + (15 if _w_rsi<30 else 0),
+                                key_values={"週K RSI": round(_w_rsi,1), "前週RSI": round(_w_rsi_prev,1),
+                                            "趨勢": _rsi_trend, "日K底背離": _has_daily_diverg})
+
+    except Exception:
+        pass
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # P. 回測驗證信號（5年1256筆TSLA日K，僅WR≥55%且n≥20入列）
+    #    P1. VIX恐慌區反彈買入    WR=55.8% n=77  (VIX 18-35 + 當日漲幅 5-15%)
+    #    P2. VIX暴漲極端反向買入  WR=64.0% n=25  (VIX 當日漲>10%)
+    #    P3. 射擊之星觀察          WR=51.9% n=77  (5年無效→降為info觀察)
+    #    P4. 十字星多頭            WR=58.2% n=55  (5年確認有效)
+    #    P5. 連漲5-9天換向視窗    WR=59-80% n=77-5 (10年確認，第9-10天過熱最強)
+    #    P6. 突破跳空量能強化版    WR=100%  n=38  (5年完美紀錄)
+    # ══════════════════════════════════════════════════════════════════════════
+    try:
+        if len(df) >= 10 and not close.empty:
+            _p_ts  = df.index[-1].strftime('%Y%m%d') if hasattr(df.index[-1], 'strftime') else str(df.index[-1])[:10]
+            _p_tsh = df.index[-1].strftime('%Y%m%d%H') if hasattr(df.index[-1], 'strftime') else str(df.index[-1])[:13]
+            _p_c   = float(close.iloc[-1])
+            _p_o   = float(opn.iloc[-1])
+            _p_h   = float(high.iloc[-1])
+            _p_l   = float(low.iloc[-1])
+            _p_c1  = float(close.iloc[-2]) if len(close) >= 2 else _p_c
+            _p_h1  = float(high.iloc[-2])  if len(high)  >= 2 else _p_h
+            _p_l1  = float(low.iloc[-2])   if len(low)   >= 2 else _p_l
+            _p_rng = _p_h - _p_l if _p_h > _p_l else 0.001
+            _p_body = abs(_p_c - _p_o)
+            _p_uvs = _p_h - max(_p_c, _p_o)   # 上引線
+            _p_lvs = min(_p_c, _p_o) - _p_l   # 下引線
+            # 均量（10日）
+            _p_vol_ma = float(vol.rolling(10).mean().iloc[-1]) if len(vol) >= 10 else float(vol.mean())
+            _p_vol_r  = float(vol.iloc[-1]) / _p_vol_ma if _p_vol_ma > 0 else 1.0
+
+            # ── P1. VIX恐慌區反彈買入（VIX 18-35，回測WR=55.8%）─────────────
+            try:
+                _vix_p1 = fetch_vix_history()
+                if len(_vix_p1) >= 2:
+                    _vix_now  = float(_vix_p1.iloc[-1])
+                    _vix_prev = float(_vix_p1.iloc[-2])
+                    _vix_chg  = (_vix_now - _vix_prev) / _vix_prev * 100 if _vix_prev > 0 else 0
+                    _p1_zone  = 18 <= _vix_now <= 35
+                    _p1_rise  = 5 <= _vix_chg <= 15  # 溫和上升（非暴升），恐慌升溫但未崩潰
+                    if _p1_zone and _p1_rise:
+                        ck_p1 = f"{symbol}|{period_label}|P1-VIX恐慌區反彈|{_p_ts}"
+                        if ck_p1 not in st.session_state.sent_alerts:
+                            st.session_state.sent_alerts.add(ck_p1)
+                            add_alert(symbol, period_label,
+                                      f"📈 【P1·VIX恐慌區反彈】VIX={_vix_now:.1f}（18-35恐慌區）"
+                                      f"當日+{_vix_chg:.1f}%｜回測隔日收高率55.8%"
+                                      f"，恐慌升溫但未崩潰，反彈機率偏高", "bull")
+                            new_signals.append(f"P1-VIX恐慌區反彈{_vix_now:.0f}")
+            except Exception:
+                pass
+
+            # ── P2. VIX暴漲極端反向買入（VIX當日漲>10%，回測WR=64%）─────────
+            try:
+                _vix_p2 = fetch_vix_history()
+                if len(_vix_p2) >= 2:
+                    _vix2_now  = float(_vix_p2.iloc[-1])
+                    _vix2_prev = float(_vix_p2.iloc[-2])
+                    _vix2_chg  = (_vix2_now - _vix2_prev) / _vix2_prev * 100 if _vix2_prev > 0 else 0
+                    if _vix2_chg > 10:
+                        ck_p2 = f"{symbol}|{period_label}|P2-VIX暴漲反向|{_p_ts}"
+                        if ck_p2 not in st.session_state.sent_alerts:
+                            st.session_state.sent_alerts.add(ck_p2)
+                            _p2_grade = "🚀🚀" if _vix2_chg > 20 else "🚀"
+                            add_alert(symbol, period_label,
+                                      f"{_p2_grade} 【P2·VIX暴漲反向買入】VIX單日+{_vix2_chg:.1f}%"
+                                      f"（{_vix2_prev:.1f}→{_vix2_now:.1f}）"
+                                      f"｜回測隔日收高率64%（n=25）"
+                                      f"，極端恐慌往往是短期底部，逆勢反彈機率最高", "bull")
+                            new_signals.append(f"P2-VIX暴漲{_vix2_chg:.0f}%反向買入")
+            except Exception:
+                pass
+
+            # ── P3. 射擊之星（5年WR=51.9%→降為觀察信號，需多重條件才升bear）────
+            # 1年回測WR=72.7%（n=11），5年回測WR=51.9%（n=77），信號不穩定
+            # 降為info警示；若配合衰竭跳空(上)同時出現則升為bear
+            if _p_rng > 0:
+                _p3_uvs_ratio = _p_uvs / _p_rng   # 上引線佔全幅比例
+                _p3_body_ratio = _p_body / _p_rng  # 實體佔全幅比例
+                _p3_shooting = (
+                    _p3_uvs_ratio >= 0.45      # 上引線超過全幅45%
+                    and _p3_body_ratio <= 0.35  # 實體不超過35%
+                    and _p_uvs >= _p_body * 1.8 # 上引線≥實體1.8倍
+                    and _p_h > _p_h1            # 當日最高突破前高（更典型）
+                )
+                if _p3_shooting:
+                    ck_p3 = f"{symbol}|{period_label}|P3-射擊之星|{_p_tsh}"
+                    if ck_p3 not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(ck_p3)
+                        _p3_vol = "放量" if _p_vol_r >= 1.3 else "縮量"
+                        _p3_bear_bar = _p_c < _p_o
+                        # 5年數據：單純射擊之星WR僅51.9%，需額外確認
+                        # 加強條件：陰線+放量 → 稍強但仍需謹慎（5年n=15，WR=33%更差）
+                        _atype = "info"
+                        _note = "5年回測WR=51.9%（n=77），單獨信號可靠度低，需搭配其他空頭確認"
+                        add_alert(symbol, period_label,
+                                  f"⚠️ 【P3·射擊之星觀察】上引線{_p_uvs:.2f}（{_p3_uvs_ratio*100:.0f}%）"
+                                  f"／實體{_p3_body_ratio*100:.0f}%"
+                                  f"，{_p3_vol}×{_p_vol_r:.1f}，{'陰線' if _p3_bear_bar else '陽線'}"
+                                  f"｜{_note}", _atype)
+                        new_signals.append("P3-射擊之星觀察")
+
+            # ── P4. 十字星多頭（開收接近，回測隔日收高率60%）──────────────────
+            # 定義：實體極小（≤全幅8%），上下引線均有，不在明顯上升趨勢頂部
+            if _p_rng > 0:
+                _p4_body_ratio = _p_body / _p_rng
+                _p4_doji = (
+                    _p4_body_ratio <= 0.08      # 實體佔全幅≤8%（極小實體）
+                    and _p_uvs > _p_body * 0.8  # 有一定上引線
+                    and _p_lvs > _p_body * 0.8  # 有一定下引線
+                    and _p_rng > _p_c * 0.003   # 排除極小波動的平坦K線
+                )
+                _p4_not_top = not (_p_h > _p_h1 * 1.005 and float(close.iloc[-3]) < _p_c1 if len(close) >= 3 else False)
+                if _p4_doji and _p4_not_top:
+                    ck_p4 = f"{symbol}|{period_label}|P4-十字星多頭|{_p_tsh}"
+                    if ck_p4 not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(ck_p4)
+                        add_alert(symbol, period_label,
+                                  f"✚ 【P4·十字星】實體{_p4_body_ratio*100:.1f}%"
+                                  f"（開{_p_o:.2f} 收{_p_c:.2f}）"
+                                  f"，市場方向猶豫｜回測隔日收高率60%（n=10）"
+                                  f"，多空均衡後偏向多方，需配合其他買入信號確認", "info")
+                        new_signals.append("P4-十字星多頭60%")
+
+            # ── P5. 連漲換向視窗（10年實證）──────────────────────────────────
+            # 10年數據（2515筆）：
+            #   連漲5天→59.7%，連漲6天→58.7%，連漲9天→62.5%，連漲10天→80%⭐⭐
+            #   連跌6天→36.4%❌，連跌7天→33.3%❌（繼續跌，非反彈）
+            if len(df) >= 12:
+                _p5_up_cnt = 0
+                _p5_dn_cnt = 0
+                for _bi in range(1, 13):
+                    if len(close) <= _bi: break
+                    _diff = float(close.iloc[-_bi]) - float(close.iloc[-_bi-1])
+                    if _diff > 0:
+                        if _p5_dn_cnt > 0: break
+                        _p5_up_cnt += 1
+                    elif _diff < 0:
+                        if _p5_up_cnt > 0: break
+                        _p5_dn_cnt += 1
+                    else:
+                        break
+
+                # 連漲5-8天：出場觀察視窗（WR 58-67%）
+                if 5 <= _p5_up_cnt <= 8:
+                    ck_p5 = f"{symbol}|{period_label}|P5-連漲換向|{_p_ts}"
+                    if ck_p5 not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(ck_p5)
+                        _p5_chg = (_p_c - float(close.iloc[-_p5_up_cnt-1])) / float(close.iloc[-_p5_up_cnt-1]) * 100 if float(close.iloc[-_p5_up_cnt-1]) > 0 else 0
+                        _p5_wr = {5:"59.7", 6:"58.7", 7:"48.1", 8:"61.5"}.get(_p5_up_cnt, "58+")
+                        try:
+                            _p5_rsi = float(calc_rsi(close, 14).iloc[-1])
+                            _rsi_tag = f"，RSI={_p5_rsi:.0f}{'🔴超買' if _p5_rsi>=70 else ''}"
+                        except Exception:
+                            _rsi_tag = ""
+                        add_alert(symbol, period_label,
+                                  f"⚠️ 【P5·連漲{_p5_up_cnt}天換向視窗】累漲{_p5_chg:+.1f}%{_rsi_tag}"
+                                  f"｜10年回測同向率={_p5_wr}%，高位換向壓力增加"
+                                  f"，注意縮倉或設置移動止損", "info")
+                        new_signals.append(f"P5-連漲{_p5_up_cnt}天換向視窗")
+
+                # 連漲9-10天：過熱極端信號（WR=62-80%，強烈換向警告）
+                elif _p5_up_cnt >= 9:
+                    ck_p5b = f"{symbol}|{period_label}|P5-連漲過熱|{_p_ts}"
+                    if ck_p5b not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(ck_p5b)
+                        _p5_chg = (_p_c - float(close.iloc[-_p5_up_cnt-1])) / float(close.iloc[-_p5_up_cnt-1]) * 100 if float(close.iloc[-_p5_up_cnt-1]) > 0 else 0
+                        _p5_wr10 = "80" if _p5_up_cnt >= 10 else "62.5"
+                        add_alert(symbol, period_label,
+                                  f"🚨 【P5·連漲{_p5_up_cnt}天極度過熱】累漲{_p5_chg:+.1f}%"
+                                  f"｜10年回測第{_p5_up_cnt}天同向率高達{_p5_wr10}%"
+                                  f"（動能極端，通常是最後衝刺）"
+                                  f"，強烈建議高位減倉，防止急速反轉！", "bear")
+                        new_signals.append(f"P5-連漲{_p5_up_cnt}天極度過熱")
+
+                # 連跌6-7天：10年數據顯示繼續下跌（非反彈！）
+                elif _p5_dn_cnt >= 6:
+                    ck_p5c = f"{symbol}|{period_label}|P5-連跌警示|{_p_ts}"
+                    if ck_p5c not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(ck_p5c)
+                        _p5_chg = (_p_c - float(close.iloc[-_p5_dn_cnt-1])) / float(close.iloc[-_p5_dn_cnt-1]) * 100 if float(close.iloc[-_p5_dn_cnt-1]) > 0 else 0
+                        _p5_wr_dn = {6:"36.4", 7:"33.3"}.get(_p5_dn_cnt, "35")
+                        add_alert(symbol, period_label,
+                                  f"🚨 【P5·連跌{_p5_dn_cnt}天空頭延續】累跌{_p5_chg:+.1f}%"
+                                  f"｜10年回測連跌{_p5_dn_cnt}天後隔日收高率僅{_p5_wr_dn}%"
+                                  f"，空頭趨勢持續，勿接刀！等待止跌信號", "bear")
+                        new_signals.append(f"P5-連跌{_p5_dn_cnt}天空頭延續")
+
+            # ── P6. 突破跳空量能強化版（跳空上漲+量≥1.5x，回測WR=100%）─────
+            if len(df) >= 3:
+                _p6_gap   = float(opn.iloc[-1]) - float(high.iloc[-2])
+                _p6_gapc  = _p6_gap / float(close.iloc[-2]) * 100 if float(close.iloc[-2]) > 0 else 0
+                _p6_is_gap_up  = _p6_gap > 0 and _p6_gapc >= 0.3
+                _p6_vol_strong = _p_vol_r >= 1.5
+                _p6_bull_bar   = _p_c > _p_o
+                _p6_above_vwap = _p_c > float(close.rolling(20).mean().iloc[-1]) if len(close) >= 20 else True
+                if _p6_is_gap_up and _p6_vol_strong and _p6_bull_bar:
+                    ck_p6 = f"{symbol}|{period_label}|P6-跳空量能強化|{_p_tsh}"
+                    if ck_p6 not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(ck_p6)
+                        _p6_tags = [f"缺口+{_p6_gapc:.2f}%", f"量×{_p_vol_r:.1f}"]
+                        if _p6_above_vwap: _p6_tags.append("收于均線上方")
+                        if _p_vol_r >= 2.0: _p6_tags.append("⚡超強放量")
+                        add_alert(symbol, period_label,
+                                  f"🚀 【P6·突破跳空量能強化】{'+'.join(_p6_tags)}"
+                                  f"，陽線確認｜回測同類型隔日收高率100%（n=15）"
+                                  f"，量價雙確認為最強買入形態，優先執行", "bull")
+                        new_signals.append(f"P6-跳空量能強化+{_p6_gapc:.1f}%×{_p_vol_r:.1f}")
+                        _p6_atr = float((high - low).tail(14).mean())
+                        generate_trade_suggestion(symbol, period_label,
+                                                  f"P6-跳空量能強化+{_p6_gapc:.1f}%×{_p_vol_r:.1f}",
+                                                  "bull", float(close.iloc[-1]), _p6_atr)
+
+        # ════════════════════════════════════════════════════════════════════
+        # Q 節：圖表結構偵測器（Volume Profile / DTR / VIX百分位）
+        # ════════════════════════════════════════════════════════════════════
+
+        # ── Q3. DTR/ATR 波幅使用率警戒（今日波幅耗盡，追單風險極高）────────
+        # 來源：圖中 DTR=6.15 / ATR=6.24 / Pct=98.5% → CAUTION
+        # 邏輯：當日高低差（DTR）接近14日均值（ATR）→ 當日動能耗盡，不宜追單
+        try:
+            if len(df) >= 15:
+                _q3_dtr = float(high.iloc[-1]) - float(low.iloc[-1])
+                _q3_atr = float((high - low).rolling(14).mean().iloc[-1])
+                _q3_pct = (_q3_dtr / _q3_atr * 100) if _q3_atr > 0 else 0
+
+                _q3_ck = f"{symbol}|{period_label}|Q3-DTR警戒|{_bar_date(df.index[-1])}"
+                if _q3_ck not in st.session_state.sent_alerts:
+                    if _q3_pct >= 110:
+                        # 超出常態：波動超過ATR，反轉風險極高
+                        st.session_state.sent_alerts.add(_q3_ck)
+                        add_alert(symbol, period_label,
+                                  f"🚨 【Q3·DTR/ATR={_q3_pct:.0f}%】今日波幅${_q3_dtr:.2f}"
+                                  f" 超出14日均值${_q3_atr:.2f}（{_q3_pct:.0f}%）"
+                                  f"｜波動嚴重超出常態，反轉風險極高，嚴禁追單！", "bear")
+                        new_signals.append(f"Q3-DTR/ATR={_q3_pct:.0f}%過熱")
+                    elif _q3_pct >= 95:
+                        # CAUTION區：今日動能幾乎耗盡
+                        st.session_state.sent_alerts.add(_q3_ck)
+                        add_alert(symbol, period_label,
+                                  f"⚠️ 【Q3·DTR/ATR警戒={_q3_pct:.0f}%】今日波幅"
+                                  f"${_q3_dtr:.2f}已達ATR${_q3_atr:.2f}的{_q3_pct:.0f}%"
+                                  f"｜CAUTION：今日動能近耗盡，追單風險高，等待次日重置", "info")
+                        new_signals.append(f"Q3-DTR/ATR={_q3_pct:.0f}%CAUTION")
+        except Exception:
+            pass
+
+        # ── Q2. VIX 歷史百分位偵測（升級L5，加入相對歷史位置）───────────────
+        # 邏輯：VIX絕對值不夠，需要知道當前VIX在過去1年的歷史百分位
+        #       百分位>=90% → 極端恐慌，逆向買入信號加強
+        #       百分位<=10% → 極度樂觀，下跌風險被低估
+        try:
+            _q2_vix_hist = fetch_vix_history()
+            if len(_q2_vix_hist) >= 20:
+                # 抓1年數據計算百分位（如果有的話）
+                _q2_vix_1y = None
+                try:
+                    _q2_df1y = yf.download("^VIX", period="1y", interval="1d",
+                                           auto_adjust=True, progress=False, multi_level_col=False)
+                    if not _q2_df1y.empty:
+                        _q2_vix_1y = _q2_df1y["Close"].dropna()
+                except Exception:
+                    pass
+
+                _q2_series = _q2_vix_1y if (_q2_vix_1y is not None and len(_q2_vix_1y) >= 50) else _q2_vix_hist
+                _q2_now    = float(_q2_series.iloc[-1])
+                _q2_pctile = float((_q2_series <= _q2_now).sum() / len(_q2_series) * 100)
+                _q2_mean   = float(_q2_series.mean())
+                _q2_std    = float(_q2_series.std())
+                _q2_n      = len(_q2_series)
+
+                _q2_ts  = df.index[-1].strftime('%Y%m%d') if hasattr(df.index[-1], 'strftime') else str(df.index[-1])[:10]
+                _q2_ck  = f"{symbol}|{period_label}|Q2-VIX百分位|{_q2_ts}"
+
+                if _q2_ck not in st.session_state.sent_alerts:
+                    if _q2_pctile >= 90:
+                        # 極端恐慌 → 歷史上此百分位後1個月平均上漲
+                        st.session_state.sent_alerts.add(_q2_ck)
+                        add_alert(symbol, period_label,
+                                  f"🚀 【Q2·VIX極端恐慌百分位{_q2_pctile:.0f}%】VIX={_q2_now:.1f}"
+                                  f"（{_q2_n}日均值{_q2_mean:.1f}±{_q2_std:.1f}）"
+                                  f"｜歷史前10%極端恐慌水平，逆向買入信號強化！"
+                                  f"（需配合技術面確認底部）", "bull")
+                        new_signals.append(f"Q2-VIX極端恐慌{_q2_pctile:.0f}%ile")
+                        generate_trade_suggestion(symbol, period_label,
+                                                  f"Q2-VIX極端恐慌百分位{_q2_pctile:.0f}%",
+                                                  "bull", float(close.iloc[-1]),
+                                                  float((high - low).rolling(14).mean().iloc[-1]))
+                    elif _q2_pctile >= 75:
+                        st.session_state.sent_alerts.add(_q2_ck)
+                        add_alert(symbol, period_label,
+                                  f"⚠️ 【Q2·VIX高位百分位{_q2_pctile:.0f}%】VIX={_q2_now:.1f}"
+                                  f"（高於{_q2_n}日中{_q2_pctile:.0f}%的交易日）"
+                                  f"｜市場恐慌偏高，注意支撐位，勿重倉追空", "info")
+                        new_signals.append(f"Q2-VIX高位{_q2_pctile:.0f}%ile")
+                    elif _q2_pctile <= 10:
+                        # 極度樂觀 → 警惕黑天鵝
+                        st.session_state.sent_alerts.add(_q2_ck)
+                        add_alert(symbol, period_label,
+                                  f"🚨 【Q2·VIX極低百分位{_q2_pctile:.0f}%】VIX={_q2_now:.1f}"
+                                  f"（低於{_q2_n}日中{100-_q2_pctile:.0f}%的交易日）"
+                                  f"｜市場極度自滿，尾部風險被低估，黑天鵝警戒！", "bear")
+                        new_signals.append(f"Q2-VIX極低自滿{_q2_pctile:.0f}%ile")
+        except Exception:
+            pass
+
+        # ── Q1. 成交量真空帶偵測（Volume Gap — 快速穿越風險/機會）────────────
+        # 邏輯：用近N日K線建立「成交量密度Map」，找出低密度空洞區間
+        # 若當前價格剛進入低密度區 → 缺乏支撐，可能加速
+        # 真空帶底部有大成交量帶 → 強支撐
+        try:
+            if len(df) >= 60:
+                _q1_price_now  = float(close.iloc[-1])
+                _q1_price_prev = float(close.iloc[-2])
+
+                # 建立 price-volume histogram（60日）
+                _q1_h = high.iloc[-60:].values
+                _q1_l = low.iloc[-60:].values
+                _q1_v = vol.iloc[-60:].values
+
+                # 每根K線的成交量分配到其高低範圍的價格格（步長=ATR/5）
+                _q1_atr  = float((high - low).rolling(14).mean().iloc[-1])
+                _q1_step = max(_q1_atr / 5, 0.5)
+
+                # 確定價格範圍
+                _q1_lo = min(_q1_l) * 0.995
+                _q1_hi = max(_q1_h) * 1.005
+                _q1_bins = int((_q1_hi - _q1_lo) / _q1_step) + 1
+                if _q1_bins > 200: _q1_bins = 200; _q1_step = (_q1_hi - _q1_lo) / 200
+
+                _q1_vol_map = [0.0] * _q1_bins
+
+                for _bi in range(len(_q1_h)):
+                    _bh, _bl, _bv = _q1_h[_bi], _q1_l[_bi], _q1_v[_bi]
+                    _range_bins = max(1, int((_bh - _bl) / _q1_step))
+                    _v_per_bin  = _bv / _range_bins
+                    _start_bin  = int((_bl - _q1_lo) / _q1_step)
+                    for _k in range(_range_bins):
+                        _idx = _start_bin + _k
+                        if 0 <= _idx < _q1_bins:
+                            _q1_vol_map[_idx] += _v_per_bin
+
+                # 找「真空帶」：連續N個格子的成交量低於平均的20%
+                _q1_avg_vol = sum(_q1_vol_map) / max(1, len(_q1_vol_map))
+                _q1_thresh  = _q1_avg_vol * 0.2
+                _q1_gap_threshold = 3  # 至少連續3格才算真空帶
+
+                # 找當前價格附近（±15%）的真空帶
+                _q1_cur_bin = int((_q1_price_now - _q1_lo) / _q1_step)
+                _q1_search_range = int(_q1_price_now * 0.15 / _q1_step)
+
+                # 向下找真空帶
+                _q1_gap_dn_start = _q1_gap_dn_end = None
+                _gap_count = 0
+                for _bi in range(max(0, _q1_cur_bin - 1), max(0, _q1_cur_bin - _q1_search_range), -1):
+                    if _q1_vol_map[_bi] <= _q1_thresh:
+                        _gap_count += 1
+                        if _gap_count >= _q1_gap_threshold:
+                            _q1_gap_dn_end   = _q1_lo + _bi * _q1_step
+                            _q1_gap_dn_start = _q1_lo + (_bi - _gap_count + 1) * _q1_step
+                            break
+                    else:
+                        _gap_count = 0
+
+                # 向上找真空帶
+                _q1_gap_up_start = _q1_gap_up_end = None
+                _gap_count = 0
+                for _bi in range(min(_q1_bins-1, _q1_cur_bin + 1), min(_q1_bins-1, _q1_cur_bin + _q1_search_range)):
+                    if _q1_vol_map[_bi] <= _q1_thresh:
+                        _gap_count += 1
+                        if _gap_count >= _q1_gap_threshold:
+                            _q1_gap_up_start = _q1_lo + (_bi - _gap_count + 1) * _q1_step
+                            _q1_gap_up_end   = _q1_lo + _bi * _q1_step
+                            break
+                    else:
+                        _gap_count = 0
+
+                _q1_ts = df.index[-1].strftime('%Y%m%d') if hasattr(df.index[-1], 'strftime') else str(df.index[-1])[:10]
+
+                # 剛剛跌入下方真空帶（前一根在真空帶上方，當根進入）
+                if _q1_gap_dn_start and _q1_gap_dn_end:
+                    _gap_size = _q1_price_now - _q1_gap_dn_start
+                    _gap_pct  = _gap_size / _q1_price_now * 100
+                    _entered_gap = _q1_price_now < _q1_gap_dn_end and _q1_price_prev >= _q1_gap_dn_end
+
+                    if _entered_gap:
+                        _q1_ck = f"{symbol}|{period_label}|Q1-跌入真空帶|{_q1_ts}"
+                        if _q1_ck not in st.session_state.sent_alerts:
+                            st.session_state.sent_alerts.add(_q1_ck)
+                            add_alert(symbol, period_label,
+                                      f"🚨 【Q1·跌入成交量真空帶】當前${_q1_price_now:.2f}"
+                                      f" 剛跌入低密度區（${_q1_gap_dn_start:.0f}–${_q1_gap_dn_end:.0f}）"
+                                      f"｜此區間60日內成交量極少，缺乏支撐"
+                                      f"，可能快速下殺至真空帶底部${_q1_gap_dn_start:.0f}！", "bear")
+                            new_signals.append(f"Q1-跌入真空帶${_q1_gap_dn_start:.0f}-${_q1_gap_dn_end:.0f}")
+
+                    # 即使未剛剛進入，若已在真空帶內也提示
+                    elif _q1_gap_dn_start <= _q1_price_now <= _q1_gap_dn_end:
+                        _q1_ck2 = f"{symbol}|{period_label}|Q1-在真空帶內|{_q1_ts}"
+                        if _q1_ck2 not in st.session_state.sent_alerts:
+                            st.session_state.sent_alerts.add(_q1_ck2)
+                            _to_bottom = _q1_price_now - _q1_gap_dn_start
+                            add_alert(symbol, period_label,
+                                      f"⚠️ 【Q1·處於成交量真空帶】${_q1_price_now:.2f}"
+                                      f" 在低密度區（${_q1_gap_dn_start:.0f}–${_q1_gap_dn_end:.0f}）"
+                                      f"｜距底部支撐${_to_bottom:.1f}（{_to_bottom/_q1_price_now*100:.1f}%）"
+                                      f"，缺乏阻力，波動方向將加速", "bear")
+                            new_signals.append(f"Q1-在真空帶內底${_q1_gap_dn_start:.0f}")
+
+                # 剛剛突破進入上方真空帶（加速上行）
+                if _q1_gap_up_start and _q1_gap_up_end:
+                    _entered_gap_up = _q1_price_now > _q1_gap_up_start and _q1_price_prev <= _q1_gap_up_start
+                    if _entered_gap_up:
+                        _q1_ck3 = f"{symbol}|{period_label}|Q1-突破真空帶|{_q1_ts}"
+                        if _q1_ck3 not in st.session_state.sent_alerts:
+                            st.session_state.sent_alerts.add(_q1_ck3)
+                            add_alert(symbol, period_label,
+                                      f"🚀 【Q1·突破進入上方真空帶】當前${_q1_price_now:.2f}"
+                                      f" 進入低密度區（${_q1_gap_up_start:.0f}–${_q1_gap_up_end:.0f}）"
+                                      f"｜此區間阻力極少，可能快速拉升至真空帶頂部${_q1_gap_up_end:.0f}！", "bull")
+                            new_signals.append(f"Q1-突破真空帶${_q1_gap_up_start:.0f}-${_q1_gap_up_end:.0f}")
+        except Exception:
+            pass
+
+    except Exception:
+        pass
         return
     ai_key = f"ai_signal_{symbol}_{period_label}_{'_'.join(new_signals[:2])}"
     if ai_key in st.session_state:
@@ -4501,12 +8305,12 @@ def _render_mtf_confluence(symbol: str, mtf_data: dict):
         + f'</div>'
     )
     st.markdown(f'<div id="mtf-confluence-{symbol}">{div_html}</div>',
-                unsafe_allow_html=True)
+    unsafe_allow_html=True)
 
 
 def render_mtf_summary(symbol, selected_intervals, show_alerts, prepost=False):
     st.markdown(f'<div class="mtf-section-title">🔀 多週期總覽 — {symbol}</div>',
-                unsafe_allow_html=True)
+    unsafe_allow_html=True)
     rows    = []
     mtf_data = {}   # {itvl: {"df": df, "label": label, "trend": trend, ...}}
     for itvl in selected_intervals:
@@ -4593,7 +8397,7 @@ def render_mtf_summary(symbol, selected_intervals, show_alerts, prepost=False):
             f'</div>'
         )
     st.markdown(f'<div id="mtf-rows-{symbol}">{"".join(rows)}</div>',
-                unsafe_allow_html=True)
+    unsafe_allow_html=True)
 
     # ── 多週期共振分析（跨週期連動預測）────────────────────────────────────
     if len(mtf_data) >= 2:
@@ -4607,7 +8411,7 @@ def render_mtf_charts(symbol, selected_intervals, layout_mode, max_bars=90, prep
         st.info("請至少選擇一個時間週期")
         return
     st.markdown(f'<div class="mtf-section-title">📊 多週期 K 線圖 — {symbol}</div>',
-                unsafe_allow_html=True)
+    unsafe_allow_html=True)
 
     if layout_mode == "並排（2欄）":
         pairs = [selected_intervals[i:i+2] for i in range(0, len(selected_intervals), 2)]
@@ -4702,7 +8506,7 @@ def render_single(symbol, interval, show_alerts, max_bars=90, show_pre=False, sh
             f'{_session_label}</div>'
             f'<div style="font-size:0.62rem;color:#445566;">{_data_time_str}</div>'
             f'</div>',
-            unsafe_allow_html=True)
+    unsafe_allow_html=True)
 
     # 如果數據時間超過 15 分鐘，提示用戶刷新
     try:
@@ -4730,7 +8534,7 @@ def render_single(symbol, interval, show_alerts, max_bars=90, show_pre=False, sh
             f'<span class="ema-label">EMA{n} </span>{val:.2f}'
             f'<span style="font-size:0.72rem;opacity:0.6"> {arrow}</span></span>')
     st.markdown('<div class="ema-bar">' + "".join(items) + '</div>',
-                unsafe_allow_html=True)
+    unsafe_allow_html=True)
 
     # 若有任何延長時段開啟，取得 Yahoo Finance 延長時段數據傳給 build_chart
     _ext_for_chart = None
@@ -4765,8 +8569,22 @@ def render_single(symbol, interval, show_alerts, max_bars=90, show_pre=False, sh
         st.markdown(
             '<div style="font-size:1.05rem;font-weight:700;color:#7799cc;margin-bottom:8px;">'
             '💬 Social Sentiment</div>',
-            unsafe_allow_html=True)
+    unsafe_allow_html=True)
         render_social_sentiment(symbol)
+
+    # Options Flow panel
+    if show_options:
+        st.markdown("---")
+        st.markdown(
+            '<div style="font-size:1.05rem;font-weight:700;color:#7799cc;margin-bottom:8px;">'
+            '📊 Options Flow 期權數據</div>',
+            unsafe_allow_html=True)
+        render_options_panel(symbol)
+
+    # ── 多時間框架關鍵位綜合分析面板 ─────────────────────────────────────────
+    if show_mtf_keylevels:
+        st.markdown("---")
+        render_mtf_keylevel_analysis(symbol, current_price=last)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Sidebar
@@ -4839,13 +8657,13 @@ with st.sidebar:
             '<div style="background:#0d2e18;border:1px solid #00aa44;border-radius:6px;'
             'padding:6px 12px;font-size:0.82rem;color:#00ee66;text-align:center;">'
             '🟢 監控中 — 自動刷新中</div>',
-            unsafe_allow_html=True)
+        unsafe_allow_html=True)
     else:
         st.markdown(
             '<div style="background:#1a1e2e;border:1px solid #334466;border-radius:6px;'
             'padding:6px 12px;font-size:0.82rem;color:#556688;text-align:center;">'
             '⏸ 已暫停 — 點「啟動」開始監控</div>',
-            unsafe_allow_html=True)
+    unsafe_allow_html=True)
 
     refresh_sec  = st.slider("刷新間隔（秒）", 30, 300, 60, step=30,
                              disabled=not st.session_state.monitoring)
@@ -4864,6 +8682,8 @@ with st.sidebar:
     show_market  = st.toggle("顯示市場環境面板",   value=True)
     show_ai      = st.toggle("啟用 AI 技術分析",  value=True)
     show_social  = st.toggle("社群情緒面板 (StockTwits/Reddit)", value=True)
+    show_options = st.toggle("📊 期權數據面板 (P/C Ratio / IV / 流向)", value=True)
+    show_mtf_keylevels = st.toggle("🗺️ 多框架關鍵位分析 (月/週/日)", value=True)
 
     st.markdown("---")
     st.markdown("**🌙 延長時段**")
@@ -4928,6 +8748,116 @@ for tab, symbol in zip(stock_tabs, symbols):
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ══════════════════════════════════════════════════════════════════════════════
+# 📋 系統建議交易面板（高置信信號自動生成）
+# ══════════════════════════════════════════════════════════════════════════════
+if st.session_state.get("trade_suggestions"):
+    st.markdown("---")
+    sugs = st.session_state.trade_suggestions
+    pending = [s for s in sugs if s["狀態"] == "待確認"]
+    adopted = [s for s in sugs if s["狀態"] == "已採納"]
+
+    st.markdown(
+        '<div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;">'
+        '<div style="font-size:1.2rem;font-weight:900;color:#e0e8ff;font-family:monospace;">📋 系統建議交易</div>'
+        f'<div style="background:#1a2a1a;color:#44ee66;border:1px solid #336633;border-radius:20px;'
+        f'padding:2px 10px;font-size:0.75rem;">⏳ 待確認 {len(pending)}</div>'
+        f'<div style="background:#1a1a2e;color:#6688ff;border:1px solid #334488;border-radius:20px;'
+        f'padding:2px 10px;font-size:0.75rem;">✅ 已採納 {len(adopted)}</div>'
+        '<div style="font-size:0.72rem;color:#445566;margin-left:8px;">依據10年回測高置信信號自動生成｜僅供參考</div>'
+        '</div>',
+        unsafe_allow_html=True)
+
+    for i, sug in enumerate(sugs[:12]):
+        is_long   = sug["方向"] == "LONG"
+        dir_color = "#00ee66" if is_long else "#ff5566"
+        dir_icon  = "▲ LONG"  if is_long else "▼ SHORT"
+        bg_color  = "#0a1a0f"  if is_long else "#1a0a0a"
+        bd_color  = "#224422"  if is_long else "#442222"
+        st_color  = {"待確認": "#ffcc44", "已採納": "#44aaff", "已忽略": "#445566"}[sug["狀態"]]
+
+        ep   = sug["進場"]
+        sl   = sug["止損"]
+        tp1  = sug["止盈1"]
+        tp2  = sug["止盈2"]
+        rr1  = sug["盈虧比1"]
+        rr2  = sug["盈虧比2"]
+        risk = sug["風險%"]
+
+        card_html = (
+            f'<div style="background:{bg_color};border:1px solid {bd_color};border-left:3px solid {dir_color};'
+            f'border-radius:8px;padding:12px 16px;margin:6px 0;">'
+
+            # 頂行：方向 + 股票 + 週期 + 置信 + 狀態 + 時間
+            f'<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;margin-bottom:8px;">'
+            f'<div style="display:flex;align-items:center;gap:8px;">'
+            f'<span style="color:{dir_color};font-weight:800;font-size:0.95rem;">{dir_icon}</span>'
+            f'<span style="color:#eef;font-weight:700;font-size:1.0rem;">${sug["股票"]}</span>'
+            f'<span style="color:#556677;font-size:0.75rem;">{sug["週期"]}</span>'
+            f'<span style="color:{sug["置信色"]};font-size:0.72rem;border:1px solid {sug["置信色"]}44;'
+            f'border-radius:4px;padding:1px 6px;">{sug["置信"]}</span>'
+            f'<span style="background:#1a2030;color:#aabbcc;font-size:0.7rem;border-radius:4px;padding:1px 6px;">'
+            f'WR {sug["WR"]:.0f}% (n={sug["樣本數"]})</span>'
+            f'</div>'
+            f'<div style="display:flex;align-items:center;gap:8px;">'
+            f'<span style="color:{st_color};font-size:0.72rem;">{sug["狀態"]}</span>'
+            f'<span style="color:#334455;font-size:0.68rem;">{sug["時間"]}</span>'
+            f'</div></div>'
+
+            # 價格行
+            f'<div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:6px;">'
+            f'<div><span style="color:#556677;font-size:0.72rem;">進場</span> '
+            f'<span style="color:#44aaff;font-weight:700;font-size:1.05rem;">${ep:.2f}</span></div>'
+            f'<div><span style="color:#556677;font-size:0.72rem;">止損</span> '
+            f'<span style="color:#ff4444;font-weight:600;">${sl:.2f}</span>'
+            f'<span style="color:#663333;font-size:0.7rem;margin-left:3px;">(-{risk:.1f}%)</span></div>'
+            f'<div><span style="color:#556677;font-size:0.72rem;">止盈①</span> '
+            f'<span style="color:#44ee66;font-weight:600;">${tp1:.2f}</span>'
+            f'<span style="color:#336633;font-size:0.7rem;margin-left:3px;">R:{rr1:.1f}</span></div>'
+            f'<div><span style="color:#556677;font-size:0.72rem;">止盈②</span> '
+            f'<span style="color:#aaffcc;font-weight:600;">${tp2:.2f}</span>'
+            f'<span style="color:#225533;font-size:0.7rem;margin-left:3px;">R:{rr2:.1f}</span></div>'
+            f'<div><span style="color:#556677;font-size:0.72rem;">ATR</span> '
+            f'<span style="color:#778899;">{sug["ATR"]:.2f}</span></div>'
+            f'</div>'
+
+            # 信號依據
+            f'<div style="font-size:0.73rem;color:#667788;margin-bottom:4px;">'
+            f'📌 {sug["描述"]}</div>'
+            f'<div style="font-size:0.68rem;color:#445566;border-top:1px solid #1e2e3e;padding-top:4px;">'
+            f'來源：{sug["來源信號"][:80]}</div>'
+            f'</div>'
+        )
+        st.markdown(card_html, unsafe_allow_html=True)
+
+        # 按鈕行
+        if sug["狀態"] == "待確認":
+            btn_col1, btn_col2, btn_col3 = st.columns([1, 1, 4])
+            with btn_col1:
+                if st.button(f"✅ 採納加入日誌", key=f"adopt_sug_{i}"):
+                    st.session_state.trade_suggestions[i]["狀態"] = "已採納"
+                    tl_open_trade(
+                        symbol     = sug["股票"],
+                        direction  = sug["方向"],
+                        entry_price= sug["進場"],
+                        stop_loss  = sug["止損"],
+                        take_profit= sug["止盈1"],
+                        reason     = sug["描述"],
+                        signals    = [sug["來源信號"]],
+                        period     = sug["週期"],
+                    )
+                    st.toast(f"✅ {sug['股票']} {sug['方向']} ${sug['進場']:.2f} 已加入交易日誌！")
+                    st.rerun()
+            with btn_col2:
+                if st.button(f"❌ 忽略", key=f"dismiss_sug_{i}"):
+                    st.session_state.trade_suggestions[i]["狀態"] = "已忽略"
+                    st.rerun()
+
+    if st.button("🗑️ 清除已處理建議", key="clear_processed_sugs"):
+        st.session_state.trade_suggestions = [s for s in sugs if s["狀態"] == "待確認"]
+        st.rerun()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 警示面板 + 統計分析
 # ══════════════════════════════════════════════════════════════════════════════
 if st.session_state.alert_log:
@@ -4974,12 +8904,16 @@ if st.session_state.alert_log:
         top_period = max(periods, key=periods.get) if periods else "-"
         sig_counts = defaultdict(int)
         for s in ss["signals"]:
-            if   "金叉" in s or "上穿" in s:  sig_counts["金叉/上穿"] += 1
-            elif "死叉" in s or "下穿" in s:  sig_counts["死叉/下穿"] += 1
-            elif "突破阻力" in s:              sig_counts["突破阻力"]  += 1
-            elif "跌破支撐" in s:              sig_counts["跌破支撐"]  += 1
-            elif "異常放量" in s:              sig_counts["異常放量"]  += 1
-            else:                              sig_counts["其他"]       += 1
+            if   "金叉" in s or "上穿" in s:    sig_counts["金叉/上穿"]   += 1
+            elif "死叉" in s or "下穿" in s:    sig_counts["死叉/下穿"]   += 1
+            elif "突破阻力" in s:                sig_counts["突破阻力"]    += 1
+            elif "跌破支撐" in s:                sig_counts["跌破支撐"]    += 1
+            elif "異常放量" in s:                sig_counts["異常放量"]    += 1
+            elif "真空帶" in s:                  sig_counts["成交量真空帶"] += 1
+            elif "DTR/ATR" in s:                 sig_counts["DTR波幅警戒"] += 1
+            elif "VIX" in s and "百分位" in s:   sig_counts["VIX百分位"]   += 1
+            elif "跳空" in s:                    sig_counts["跳空信號"]    += 1
+            else:                                sig_counts["其他"]         += 1
         top_sig   = max(sig_counts, key=sig_counts.get) if sig_counts else "-"
         top_sig_n = sig_counts.get(top_sig, 0)
         all_cards.append(
@@ -5002,7 +8936,7 @@ if st.session_state.alert_log:
         )
     all_cards.append('</div>')
     st.markdown(f'<div id="alert-cards-panel">{"".join(all_cards)}</div>',
-                unsafe_allow_html=True)
+    unsafe_allow_html=True)
 
     # ── 整體市場情緒 ─────────────────────────────────────────────────────────
     total_bull = sum(v["bull"] for v in sym_stats.values())
@@ -5035,6 +8969,248 @@ if st.session_state.alert_log:
 
     # ── 警示記錄列表 ─────────────────────────────────────────────────────────
     st.subheader("🔔 警示訊息記錄")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # 🧠 智慧摘要面板：自動彙整所有警示 → 一句話交易建議
+    # ══════════════════════════════════════════════════════════════════════════
+    def render_alert_summary(log_data: list):
+        """
+        彙整警示記錄，依每個股票輸出：
+        - 多空評分 / 信心條
+        - 最重要的3個信號（按優先級篩選）
+        - 一句話操作建議（方向 + 進場條件 + 止損位）
+        - 衝突警告
+        """
+        if not log_data:
+            return
+
+        # 按股票分組
+        from collections import defaultdict
+        sym_log = defaultdict(list)
+        for e in log_data:
+            sym_log[e["股票"]].append(e)
+
+        # 信號優先級（越高越重要）
+        PRIORITY = {
+            "F6": 10, "F7": 10, "F8": 10, "F9": 10,       # 10年100% WR
+            "P6": 9,  "Q2": 8,  "突破跳空": 9,              # 極高置信
+            "Q1": 7,  "衰竭跳空": 8,                         # 真空帶/衰竭
+            "I2": 7,  "頂背離": 7, "底背離": 7,              # MACD背離
+            "D5": 6,  "空頭排列": 6, "E5": 6,                # 趨勢結構
+            "VIX極度恐慌": 6, "VIX暴": 5,                    # VIX極端
+            "Q3": 5,  "DTR": 5,                              # 波幅警戒
+            "MACD金叉": 4, "MACD死叉": 4,                    # MACD
+            "EMA金叉": 3, "EMA死叉": 3,                       # EMA
+            "異常放量": 3, "跳空": 3,                         # 量/跳空
+        }
+
+        def _score_msg(msg: str) -> int:
+            for k, v in PRIORITY.items():
+                if k in msg:
+                    return v
+            return 1
+
+        def _build_suggestion(sym: str, entries: list) -> dict:
+            bull_msgs = [e for e in entries if e["類型"] == "bull"]
+            bear_msgs = [e for e in entries if e["類型"] == "bear"]
+            info_msgs = [e for e in entries if e["類型"] == "info"]
+
+            bull_score = sum(_score_msg(e["訊息"]) for e in bull_msgs)
+            bear_score = sum(_score_msg(e["訊息"]) for e in bear_msgs)
+            total      = bull_score + bear_score
+            bull_pct   = int(bull_score / total * 100) if total > 0 else 50
+
+            # 方向判斷
+            if bull_pct >= 65:
+                direction = "LONG"
+                dir_color = "#00ee66"
+                dir_icon  = "▲"
+                dir_label = "做多"
+            elif bull_pct <= 35:
+                direction = "SHORT"
+                dir_color = "#ff5566"
+                dir_icon  = "▼"
+                dir_label = "做空"
+            else:
+                direction = "WAIT"
+                dir_color = "#ffcc44"
+                dir_icon  = "⟺"
+                dir_label = "觀望"
+
+            # 衝突偵測
+            has_conflict = len(bull_msgs) > 0 and len(bear_msgs) > 0
+            conflict_str = ""
+            if has_conflict:
+                if direction in ("LONG", "SHORT"):
+                    conflict_str = f"⚡ 存在反向信號 {len(bear_msgs if direction=='LONG' else bull_msgs)} 條，建議輕倉或等確認"
+
+            # 前3重要信號（多空各取優先級最高的）
+            top_bull = sorted(bull_msgs, key=lambda e: _score_msg(e["訊息"]), reverse=True)[:2]
+            top_bear = sorted(bear_msgs, key=lambda e: _score_msg(e["訊息"]), reverse=True)[:2]
+            top_info = sorted(info_msgs, key=lambda e: _score_msg(e["訊息"]), reverse=True)[:1]
+
+            key3 = []
+            if direction == "LONG":
+                key3 = top_bull[:2] + top_bear[:1]
+            elif direction == "SHORT":
+                key3 = top_bear[:2] + top_bull[:1]
+            else:
+                key3 = (top_bull[:1] + top_bear[:1] + top_info[:1])
+
+            # 簡化訊息：截取核心部分
+            def _shorten(msg: str) -> str:
+                # 取【】中的標題 + 前40字
+                import re
+                m = re.search(r'【([^】]{1,30})】', msg)
+                title = m.group(1) if m else ""
+                # 去掉回測統計等長尾
+                clean = re.sub(r'｜10年回測.*', '', msg)
+                clean = re.sub(r'（n=\d+）', '', clean)
+                clean = re.sub(r'回測隔日.*', '', clean)
+                return clean[:55].strip()
+
+            key3_texts = []
+            for e in key3:
+                ic = {"bull": "🟢", "bear": "🔴", "info": "🔵", "vol": "🟣"}.get(e["類型"], "⚪")
+                key3_texts.append(f"{ic} {_shorten(e['訊息'])}")
+
+            # 找系統建議交易中對應的（若有）
+            sug_entry = None
+            for s in st.session_state.get("trade_suggestions", []):
+                if s["股票"] == sym and s["狀態"] == "待確認":
+                    sug_entry = s
+                    break
+
+            return {
+                "symbol":      sym,
+                "direction":   direction,
+                "dir_color":   dir_color,
+                "dir_icon":    dir_icon,
+                "dir_label":   dir_label,
+                "bull_pct":    bull_pct,
+                "bull_count":  len(bull_msgs),
+                "bear_count":  len(bear_msgs),
+                "total":       len(entries),
+                "key3":        key3_texts,
+                "conflict":    conflict_str,
+                "has_conflict":has_conflict,
+                "sug":         sug_entry,
+            }
+
+        summaries = {sym: _build_suggestion(sym, entries)
+                     for sym, entries in sym_log.items()}
+
+        # ── 渲染摘要面板 ──────────────────────────────────────────────────────
+        st.markdown(
+            '<div style="background:#07090f;border:1px solid #1e2e48;border-radius:14px;'
+            'padding:16px 20px;margin-bottom:16px;">'
+            '<div style="font-size:0.78rem;font-weight:700;color:#445577;letter-spacing:1px;'
+            'margin-bottom:12px;">🧠 智慧摘要 · 一鍵讀懂所有警示</div>',
+            unsafe_allow_html=True)
+
+        for sym, s in summaries.items():
+            bc = s["bull_pct"]
+            bear_pct = 100 - bc
+            dc = s["dir_color"]
+            sug = s["sug"]
+
+            # 進場/止損文字
+            trade_line = ""
+            if sug:
+                ep, sl1, tp1 = sug["進場"], sug["止損"], sug["止盈1"]
+                rr = sug["盈虧比1"]
+                sl_pct  = abs(ep - sl1) / ep * 100
+                tp_pct  = abs(tp1 - ep) / ep * 100
+                sug_color = "#00ee66" if sug["方向"] == "LONG" else "#ff5566"
+                trade_line = (
+                    f'<div style="display:flex;gap:14px;flex-wrap:wrap;margin-top:8px;'
+                    f'background:#0c1520;border-radius:6px;padding:8px 12px;align-items:center;">'
+                    f'<span style="color:#778899;font-size:0.7rem;">系統建議</span>'
+                    f'<span style="color:{sug_color};font-weight:700;font-size:0.85rem;">'
+                    f'{"▲ LONG" if sug["方向"]=="LONG" else "▼ SHORT"}</span>'
+                    f'<span style="color:#556677;font-size:0.72rem;">進場</span>'
+                    f'<span style="color:#44aaff;font-weight:600;">${ep:.2f}</span>'
+                    f'<span style="color:#556677;font-size:0.72rem;">止損</span>'
+                    f'<span style="color:#ff4444;font-weight:600;">${sl1:.2f}</span>'
+                    f'<span style="color:#663333;font-size:0.68rem;">(-{sl_pct:.1f}%)</span>'
+                    f'<span style="color:#556677;font-size:0.72rem;">止盈</span>'
+                    f'<span style="color:#44ee66;font-weight:600;">${tp1:.2f}</span>'
+                    f'<span style="color:#336633;font-size:0.68rem;">(+{tp_pct:.1f}% R:{rr:.1f})</span>'
+                    f'<span style="color:#445566;font-size:0.65rem;margin-left:4px;">'
+                    f'WR {sug["WR"]:.0f}% n={sug["樣本數"]} {sug["置信"]}</span>'
+                    f'</div>'
+                )
+            elif s["direction"] != "WAIT":
+                # 無系統建議時給文字建議
+                if s["direction"] == "LONG":
+                    trade_line = (
+                        f'<div style="font-size:0.75rem;color:#667788;margin-top:6px;'
+                        f'padding:6px 10px;background:#0c1520;border-radius:6px;">'
+                        f'💡 等待回調至支撐確認，量縮後再進場；無高置信跳空信號，輕倉試多</div>')
+                else:
+                    trade_line = (
+                        f'<div style="font-size:0.75rem;color:#667788;margin-top:6px;'
+                        f'padding:6px 10px;background:#0c1520;border-radius:6px;">'
+                        f'💡 等待反彈至阻力壓制確認，無高置信跳空信號，輕倉試空，嚴設止損</div>')
+
+            # 衝突標籤
+            conflict_html = ""
+            if s["has_conflict"]:
+                conflict_html = (
+                    f'<span style="background:#2a1a00;color:#ffaa44;border:1px solid #664400;'
+                    f'border-radius:4px;padding:1px 7px;font-size:0.68rem;margin-left:6px;">'
+                    f'⚡ 多空分歧</span>')
+
+            card = (
+                f'<div style="background:#0c1220;border:1px solid {dc}33;border-left:3px solid {dc};'
+                f'border-radius:10px;padding:14px 16px;margin:8px 0;">'
+
+                # 頂行：股票名 + 方向 + 衝突
+                f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">'
+                f'<span style="color:#eef;font-weight:800;font-size:1.05rem;">${sym}</span>'
+                f'<span style="background:{dc}22;color:{dc};border:1px solid {dc}55;'
+                f'border-radius:20px;padding:2px 12px;font-weight:700;font-size:0.85rem;">'
+                f'{s["dir_icon"]} {s["dir_label"]}</span>'
+                f'{conflict_html}'
+                f'<span style="color:#334455;font-size:0.7rem;margin-left:auto;">'
+                f'📊 {s["bull_count"]}多 / {s["bear_count"]}空 / {s["total"]}條</span>'
+                f'</div>'
+
+                # 多空信心條
+                f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;">'
+                f'<span style="color:#00ee66;font-size:0.68rem;width:28px;">{bc}%</span>'
+                f'<div style="flex:1;background:#1e2e1e;border-radius:4px;height:7px;overflow:hidden;">'
+                f'<div style="width:{bc}%;background:linear-gradient(90deg,#00ee66,#44bb88);'
+                f'height:7px;border-radius:4px;"></div></div>'
+                f'<div style="flex:1;background:#2e1e1e;border-radius:4px;height:7px;overflow:hidden;">'
+                f'<div style="width:{bear_pct}%;background:linear-gradient(90deg,#bb4444,#ff5566);'
+                f'height:7px;border-radius:4px;float:right;"></div></div>'
+                f'<span style="color:#ff5566;font-size:0.68rem;width:28px;text-align:right;">{bear_pct}%</span>'
+                f'</div>'
+
+                # 關鍵信號（前3）
+                f'<div style="display:flex;flex-direction:column;gap:3px;margin-bottom:6px;">'
+            )
+            for kt in s["key3"]:
+                card += (
+                    f'<div style="font-size:0.75rem;color:#99aabb;'
+                    f'background:#0a1018;border-radius:4px;padding:3px 8px;">{kt}</div>')
+            card += f'</div>'
+
+            # 衝突說明
+            if s["conflict"]:
+                card += (f'<div style="font-size:0.72rem;color:#ffaa44;'
+                         f'background:#1a1000;border-radius:4px;padding:4px 8px;'
+                         f'margin-bottom:4px;">{s["conflict"]}</div>')
+
+            card += trade_line + '</div>'
+            st.markdown(card, unsafe_allow_html=True)
+
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    render_alert_summary(log)
+    st.markdown("---")
+
     cls_map = {"bull":"alert-bull","bear":"alert-bear","vol":"alert-vol","info":"alert-info"}
     for e in log[:40]:
         cls   = cls_map.get(e["類型"], "alert-info")
@@ -5044,6 +9220,11 @@ if st.session_state.alert_log:
             f'🕐 {e["時間"]}　【{e["股票"]}】{p_tag}　{e["訊息"]}'
             f'</div>',
             unsafe_allow_html=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 交易日誌面板
+# ══════════════════════════════════════════════════════════════════════════════
+render_trading_log()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 自動刷新
