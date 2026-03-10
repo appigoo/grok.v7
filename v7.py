@@ -9428,6 +9428,318 @@ def render_mtf_charts(symbol, selected_intervals, layout_mode, max_bars=90, prep
 # ══════════════════════════════════════════════════════════════════════════════
 # 單週期渲染
 # ══════════════════════════════════════════════════════════════════════════════
+def render_traffic_light(symbol: str, df, last: float, trend: str, interval: str):
+    """
+    🚦 交通燈 + 一鍵指令面板
+    最頂部顯示：🟢做多 / 🔴做空 / 🟡觀望
+    點進去才看詳細
+    """
+    close = df["Close"]
+    high  = df["High"]
+    low   = df["Low"]
+    vol   = df["Volume"]
+
+    # ── 計算交通燈分數 ─────────────────────────────────────────────────────
+    score = 0   # 正=多頭，負=空頭
+
+    # 1. EMA排列（最重要）
+    ema_vals = [float(close.ewm(span=n, adjust=False).mean().iloc[-1])
+                for n in [5, 10, 20, 60, 120, 200]]
+    if all(ema_vals[i] > ema_vals[i+1] for i in range(len(ema_vals)-1)):
+        score += 3   # 全多頭排列
+    elif ema_vals[0] > ema_vals[2] > ema_vals[4]:
+        score += 2   # 部分多頭
+    elif all(ema_vals[i] < ema_vals[i+1] for i in range(len(ema_vals)-1)):
+        score -= 3   # 全空頭排列
+    elif ema_vals[0] < ema_vals[2] < ema_vals[4]:
+        score -= 2
+
+    # 2. MACD方向
+    dif = close.ewm(span=12).mean() - close.ewm(span=26).mean()
+    dea = dif.ewm(span=9).mean()
+    if float(dif.iloc[-1]) > float(dea.iloc[-1]):
+        score += 1
+        if float(dif.iloc[-1]) > float(dif.iloc[-2]):
+            score += 1   # DIF上升中
+    else:
+        score -= 1
+        if float(dif.iloc[-1]) < float(dif.iloc[-2]):
+            score -= 1
+
+    # 3. RSI位置
+    delta = close.diff()
+    gain  = delta.where(delta > 0, 0).rolling(14).mean()
+    loss  = (-delta.where(delta < 0, 0)).rolling(14).mean()
+    rsi   = 100 - 100 / (1 + gain / loss.replace(0, 1e-9))
+    rsi_v = float(rsi.iloc[-1])
+    if rsi_v >= 55:   score += 1
+    elif rsi_v <= 45: score -= 1
+    if rsi_v <= 30:   score += 2   # 超賣反彈機會
+    if rsi_v >= 70:   score -= 1   # 超買警惕
+
+    # 4. 價格 vs EMA20
+    e20 = float(close.ewm(span=20).mean().iloc[-1])
+    if last > e20 * 1.005:  score += 1
+    elif last < e20 * 0.995: score -= 1
+
+    # 5. 盤整壓縮偵測（中性加權）
+    if len(df) >= 15:
+        _w = df.iloc[-16:-1]
+        _rng = float(_w["High"].max()) - float(_w["Low"].min())
+        _atr = float((high - low).rolling(14).mean().iloc[-1])
+        _compressed = _rng / max(_atr, 0.01) < 1.2
+    else:
+        _compressed = False
+
+    # ── 方向判定 ──────────────────────────────────────────────────────────
+    if score >= 4:
+        light = "🟢"; action = "做多"; light_color = "#00ee66"
+        light_bg = "#001a08"; light_border = "#004422"
+        confidence = min(95, 60 + score * 5)
+    elif score >= 2:
+        light = "🟢"; action = "偏多"; light_color = "#44cc66"
+        light_bg = "#001208"; light_border = "#003322"
+        confidence = min(80, 50 + score * 5)
+    elif score <= -4:
+        light = "🔴"; action = "做空"; light_color = "#ff4455"
+        light_bg = "#1a0008"; light_border = "#440011"
+        confidence = min(95, 60 + abs(score) * 5)
+    elif score <= -2:
+        light = "🔴"; action = "偏空"; light_color = "#cc4466"
+        light_bg = "#120008"; light_border = "#330011"
+        confidence = min(80, 50 + abs(score) * 5)
+    else:
+        light = "🟡"; action = "觀望"; light_color = "#ffcc44"
+        light_bg = "#1a1400"; light_border = "#443300"
+        confidence = 40
+
+    # ── 計算進場/止損/目標 ─────────────────────────────────────────────────
+    atr_val = float((high - low).rolling(14).mean().iloc[-1])
+    if action in ("做多", "偏多"):
+        entry  = round(last, 2)
+        sl     = round(last - atr_val * 1.5, 2)
+        tp1    = round(last + atr_val * 2.0, 2)
+        tp2    = round(last + atr_val * 4.0, 2)
+        rr     = round(atr_val * 2.0 / max(atr_val * 1.5, 0.01), 1)
+    elif action in ("做空", "偏空"):
+        entry  = round(last, 2)
+        sl     = round(last + atr_val * 1.5, 2)
+        tp1    = round(last - atr_val * 2.0, 2)
+        tp2    = round(last - atr_val * 4.0, 2)
+        rr     = round(atr_val * 2.0 / max(atr_val * 1.5, 0.01), 1)
+    else:
+        entry = sl = tp1 = tp2 = rr = None
+
+    # ── 壓縮區間提示 ───────────────────────────────────────────────────────
+    compress_note = "🔲 均線壓縮中，等待方向突破" if _compressed else ""
+
+    # ── 主卡片 HTML ────────────────────────────────────────────────────────
+    # 信心條
+    bar_w   = confidence
+    bar_col = light_color
+
+    card = (
+        f'<div style="background:{light_bg};border:2px solid {light_border};'
+        f'border-radius:16px;padding:18px 22px;margin-bottom:16px;">'
+
+        # 頂行：交通燈 + 股票 + 動作
+        f'<div style="display:flex;align-items:center;gap:14px;margin-bottom:14px;">'
+        f'<span style="font-size:2.8rem;line-height:1;">{light}</span>'
+        f'<div>'
+        f'<div style="color:#ccddee;font-size:0.75rem;margin-bottom:2px;">${symbol} · {interval}</div>'
+        f'<div style="color:{light_color};font-weight:900;font-size:1.6rem;'
+        f'font-family:monospace;letter-spacing:2px;">{action}</div>'
+        f'</div>'
+        f'<div style="margin-left:auto;text-align:right;">'
+        f'<div style="color:#445566;font-size:0.68rem;margin-bottom:4px;">信心度</div>'
+        f'<div style="color:{light_color};font-weight:800;font-size:1.3rem;">{confidence}%</div>'
+        f'</div></div>'
+
+        # 信心條
+        f'<div style="background:#0a0c10;border-radius:6px;height:6px;'
+        f'margin-bottom:14px;overflow:hidden;">'
+        f'<div style="width:{bar_w}%;height:6px;border-radius:6px;'
+        f'background:linear-gradient(90deg,{bar_col}88,{bar_col});"></div></div>'
+    )
+
+    # 進場指令區
+    if entry and action != "觀望":
+        sl_pct  = abs(entry - sl) / entry * 100
+        tp1_pct = abs(tp1  - entry) / entry * 100
+        card += (
+            f'<div style="display:grid;grid-template-columns:repeat(4,1fr);'
+            f'gap:10px;margin-bottom:12px;">'
+
+            f'<div style="background:#0a1018;border-radius:8px;padding:10px;text-align:center;">'
+            f'<div style="color:#445566;font-size:0.65rem;margin-bottom:4px;">進場價</div>'
+            f'<div style="color:#aabbff;font-weight:700;font-size:1.0rem;">${entry:.2f}</div>'
+            f'</div>'
+
+            f'<div style="background:#1a0808;border-radius:8px;padding:10px;text-align:center;">'
+            f'<div style="color:#445566;font-size:0.65rem;margin-bottom:4px;">止損</div>'
+            f'<div style="color:#ff5566;font-weight:700;font-size:1.0rem;">${sl:.2f}</div>'
+            f'<div style="color:#663333;font-size:0.62rem;">-{sl_pct:.1f}%</div>'
+            f'</div>'
+
+            f'<div style="background:#081a08;border-radius:8px;padding:10px;text-align:center;">'
+            f'<div style="color:#445566;font-size:0.65rem;margin-bottom:4px;">目標①</div>'
+            f'<div style="color:#44ee66;font-weight:700;font-size:1.0rem;">${tp1:.2f}</div>'
+            f'<div style="color:#336633;font-size:0.62rem;">+{tp1_pct:.1f}%</div>'
+            f'</div>'
+
+            f'<div style="background:#081a08;border-radius:8px;padding:10px;text-align:center;">'
+            f'<div style="color:#445566;font-size:0.65rem;margin-bottom:4px;">目標②</div>'
+            f'<div style="color:#00ffaa;font-weight:700;font-size:1.0rem;">${tp2:.2f}</div>'
+            f'<div style="color:#336633;font-size:0.62rem;">R:R {rr:.1f}x</div>'
+            f'</div>'
+            f'</div>'
+        )
+    elif action == "觀望":
+        card += (
+            f'<div style="background:#0a0c08;border-radius:8px;padding:12px;'
+            f'margin-bottom:12px;text-align:center;">'
+            f'<div style="color:#667788;font-size:0.85rem;">'
+            f'⌛ 多空信號互相抵消，等待明確方向後再進場</div>'
+            f'</div>'
+        )
+
+    # 壓縮提示
+    if compress_note:
+        card += (
+            f'<div style="background:#141000;border:1px solid #443300;'
+            f'border-radius:6px;padding:8px 12px;margin-bottom:10px;">'
+            f'<span style="color:#ffcc44;font-size:0.75rem;">{compress_note}</span>'
+            f'<span style="color:#665500;font-size:0.7rem;margin-left:8px;">'
+            f'突破上邊界→追多｜跌破下邊界→追空</span>'
+            f'</div>'
+        )
+
+    # 評分細節（可展開）
+    score_detail = (
+        f'EMA排列{"✅" if score > 0 else "❌"}  '
+        f'MACD{"✅" if float(dif.iloc[-1])>float(dea.iloc[-1]) else "❌"}  '
+        f'RSI={rsi_v:.0f}{"⚠️超買" if rsi_v>=70 else "⚠️超賣" if rsi_v<=30 else ""}  '
+        f'ATR={atr_val:.2f}  綜合分={score:+d}'
+    )
+    card += (
+        f'<div style="color:#334455;font-size:0.65rem;padding-top:8px;'
+        f'border-top:1px solid #1a2030;">{score_detail}</div>'
+        f'</div>'
+    )
+
+    st.markdown(card, unsafe_allow_html=True)
+    return action, entry, sl, tp1, tp2, confidence
+
+
+def render_daily_briefing(symbols: list):
+    """
+    📋 每日操作簡報
+    開盤前自動生成所有股票的今日計劃
+    """
+    import pytz as _ptz
+    _et  = _ptz.timezone("America/New_York")
+    _now = datetime.now(_et)
+    _is_premarket = _now.hour < 9 or (_now.hour == 9 and _now.minute < 30)
+
+    st.markdown(
+        f'<div style="background:#07090f;border:1px solid #1e2e48;'
+        f'border-radius:14px;padding:16px 20px;margin-bottom:16px;">'
+        f'<div style="font-size:0.78rem;font-weight:700;color:#445577;'
+        f'letter-spacing:1px;margin-bottom:4px;">'
+        f'📋 今日操作簡報 · {_now.strftime("%m/%d")} ET</div>'
+        f'<div style="font-size:0.65rem;color:#334455;margin-bottom:12px;">'
+        f'{"🌅 開盤前評估" if _is_premarket else "📊 盤中更新"}</div>',
+        unsafe_allow_html=True)
+
+    rows = []
+    for sym in symbols[:8]:   # 最多8個
+        try:
+            _df = fetch_data(sym, "1d")
+            if _df.empty or len(_df) < 5:
+                continue
+            _c    = _df["Close"]
+            _last = float(_c.iloc[-1])
+            _atr  = float((_df["High"] - _df["Low"]).rolling(14).mean().iloc[-1])
+            # 快速評分
+            _e5   = float(_c.ewm(span=5).mean().iloc[-1])
+            _e20  = float(_c.ewm(span=20).mean().iloc[-1])
+            _e60  = float(_c.ewm(span=60).mean().iloc[-1])
+            _dif  = float((_c.ewm(span=12).mean() - _c.ewm(span=26).mean()).iloc[-1])
+            _dea  = float((_c.ewm(span=12).mean() - _c.ewm(span=26).mean()).ewm(span=9).mean().iloc[-1])
+
+            _sc = 0
+            if _e5 > _e20 > _e60:   _sc += 2
+            elif _e5 < _e20 < _e60: _sc -= 2
+            if _dif > _dea: _sc += 1
+            else:           _sc -= 1
+            if _last > _e20 * 1.005: _sc += 1
+            elif _last < _e20 * 0.995: _sc -= 1
+
+            if _sc >= 3:
+                _light = "🟢"; _act = "做多"
+                _lc    = "#00ee66"
+                _sl    = round(_last - _atr * 1.5, 2)
+                _tp    = round(_last + _atr * 2.0, 2)
+            elif _sc <= -3:
+                _light = "🔴"; _act = "做空"
+                _lc    = "#ff5566"
+                _sl    = round(_last + _atr * 1.5, 2)
+                _tp    = round(_last - _atr * 2.0, 2)
+            else:
+                _light = "🟡"; _act = "觀望"
+                _lc    = "#ffcc44"
+                _sl    = _tp = None
+
+            rows.append({
+                "sym": sym, "last": _last, "light": _light,
+                "act": _act, "lc": _lc, "sl": _sl, "tp": _tp,
+                "atr": _atr, "sc": _sc
+            })
+        except Exception:
+            continue
+
+    if not rows:
+        st.markdown('<div style="color:#445566;font-size:0.8rem;">暫無數據</div>', unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+        return
+
+    # 表格渲染
+    tbl = (
+        '<table style="width:100%;border-collapse:collapse;font-size:0.78rem;">'
+        '<tr style="color:#334455;border-bottom:1px solid #1a2030;">'
+        '<th style="text-align:left;padding:4px 8px;">股票</th>'
+        '<th style="padding:4px 8px;">方向</th>'
+        '<th style="padding:4px 8px;">現價</th>'
+        '<th style="padding:4px 8px;">止損</th>'
+        '<th style="padding:4px 8px;">目標</th>'
+        '<th style="padding:4px 8px;">ATR</th>'
+        '<th style="padding:4px 8px;">評分</th>'
+        '</tr>'
+    )
+    for r in rows:
+        _sl_str = f'${r["sl"]:.2f}' if r["sl"] else '—'
+        _tp_str = f'${r["tp"]:.2f}' if r["tp"] else '—'
+        tbl += (
+            f'<tr style="border-bottom:1px solid #0e1520;">'
+            f'<td style="padding:6px 8px;color:#aabbcc;font-weight:700;">${r["sym"]}</td>'
+            f'<td style="padding:6px 8px;text-align:center;">'
+            f'<span style="background:{r["lc"]}22;color:{r["lc"]};'
+            f'border-radius:10px;padding:2px 10px;font-weight:700;">'
+            f'{r["light"]} {r["act"]}</span></td>'
+            f'<td style="padding:6px 8px;text-align:center;color:#778899;">${r["last"]:.2f}</td>'
+            f'<td style="padding:6px 8px;text-align:center;color:#ff5566;">{_sl_str}</td>'
+            f'<td style="padding:6px 8px;text-align:center;color:#44ee66;">{_tp_str}</td>'
+            f'<td style="padding:6px 8px;text-align:center;color:#445566;">${r["atr"]:.2f}</td>'
+            f'<td style="padding:6px 8px;text-align:center;'
+            f'color:{"#00ee66" if r["sc"]>0 else "#ff5566" if r["sc"]<0 else "#ffcc44"};">'
+            f'{r["sc"]:+d}</td>'
+            f'</tr>'
+        )
+    tbl += '</table>'
+    st.markdown(tbl, unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
 def render_single(symbol, interval, show_alerts, max_bars=90, show_pre=False, show_post=False, show_night=False):
     label, _ = INTERVAL_MAP[interval]
     _prepost = show_pre or show_post or show_night
@@ -9474,12 +9786,14 @@ def render_single(symbol, interval, show_alerts, max_bars=90, show_pre=False, sh
         _session_color = "#888888"
         _data_time_str = ""
 
+    # ── 🚦 交通燈指令面板（最頂部，用戶第一眼看到）──────────────────────────
+    render_traffic_light(symbol, df, last, trend, label)
+
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("最新價格",      f"${last:.2f}", f"{chg:+.2f} ({pct:+.2f}%)")
     c2.metric("成交量（萬股）", f"{vol_now/10000:.1f}")
     c3.metric("本K最高",       f"${df['High'].iloc[-1]:.2f}")
     c4.metric("本K最低",       f"${df['Low'].iloc[-1]:.2f}")
-    t_cls  = {"多頭":"trend-bull","空頭":"trend-bear","盤整":"trend-side"}[trend]
     t_icon = {"多頭":"▲","空頭":"▼","盤整":"◆"}[trend]
     with c5:
         st.markdown(
@@ -9667,6 +9981,7 @@ with st.sidebar:
     show_social  = st.toggle("社群情緒面板 (StockTwits/Reddit)", value=True)
     show_options = st.toggle("📊 期權數據面板 (P/C Ratio / IV / 流向)", value=True)
     show_mtf_keylevels = st.toggle("🗺️ 多框架關鍵位分析 (月/週/日)", value=True)
+    show_briefing = st.toggle("📋 今日操作簡報（全股票一覽）", value=True)
 
     st.markdown("---")
     st.markdown("**🌙 延長時段**")
@@ -9705,6 +10020,10 @@ if not symbols:
         st.cache_data.clear()
         st.rerun()
     st.stop()
+
+# ── 📋 今日操作簡報（最頂部，全股票一覽）─────────────────────────────────────
+if show_briefing:
+    render_daily_briefing(symbols)
 
 # ── 市場環境面板（置頂）──────────────────────────────────────────────────────
 if show_market:
