@@ -10212,6 +10212,27 @@ def render_make_100_mode(symbols: list):
             unsafe_allow_html=True)
         return
 
+    # ── Telegram 通知（找到機會時發送，每個機會只發一次）────────────────
+    _tg_key = f"m100_tg_sent_{best['sym']}_{best['dir']}_{best['entry']}"
+    if _tg_key not in st.session_state:
+        st.session_state[_tg_key] = True
+        _di_txt = "做多 🟢" if best["dir"] == "LONG" else "做空 🔴"
+        _tg_msg = (
+            f"💰 <b>今天賺$100 · 機會出現！</b>\n\n"
+            f"📌 股票：<b>${best['sym']}</b>\n"
+            f"方向：<b>{_di_txt}</b>\n"
+            f"進場價：<b>${best['entry']:.2f}</b>\n"
+            f"止損：<b>${best['sl']:.2f}</b>（-{abs(best['entry']-best['sl'])/best['entry']*100:.1f}%）\n"
+            f"目標：<b>${best['tp']:.2f}</b>（+{abs(best['tp']-best['entry'])/best['entry']*100:.1f}%）\n\n"
+            f"📊 買入：<b>{best['shares']} 股</b>（${best['cost']:.0f}）\n"
+            f"預計獲利：<b>+${best['profit']:.0f}</b>\n"
+            f"最大虧損：<b>-${best['loss']:.0f}</b>\n"
+            f"風險報酬：<b>{best['profit']/max(best['loss'],1):.1f}:1</b>\n\n"
+            f"🎯 信心度：{best['conf']}%　ATR={best['atr']}"
+            + (f"\n🔲 均線壓縮中，突破概率高" if best.get("compressed") else "")
+        )
+        send_telegram(_tg_msg)
+
     dc     = "#00ee66" if best["dir"] == "LONG" else "#ff5566"
     di     = "🟢 做多" if best["dir"] == "LONG" else "🔴 做空"
     sl_pct = abs(best["entry"] - best["sl"]) / best["entry"] * 100
@@ -10312,6 +10333,11 @@ def render_make_100_mode(symbols: list):
             st.session_state.m100_earned += best["profit"]
             st.session_state.m100_trade_done = True
             st.session_state.m100_trade      = None
+            send_telegram(
+                f"🎉 <b>今天賺$100 · 達標！</b>\n"
+                f"${best['sym']} 獲利 <b>+${best['profit']:.0f}</b>\n"
+                f"今日累計：<b>${st.session_state.m100_earned:.0f}</b> ✅"
+            )
             st.rerun()
 
     with col_lose:
@@ -10319,6 +10345,12 @@ def render_make_100_mode(symbols: list):
                      use_container_width=True):
             st.session_state.m100_earned -= best["loss"]
             st.session_state.m100_trade   = None
+            send_telegram(
+                f"⛔ <b>今天賺$100 · 止損</b>\n"
+                f"${best['sym']} 虧損 <b>-${best['loss']:.0f}</b>\n"
+                f"今日累計：<b>${st.session_state.m100_earned:.0f}</b>"
+                + ("\n\n⚠️ 今日虧損已達上限，建議停止交易" if st.session_state.m100_earned <= -TARGET else "")
+            )
             if st.session_state.m100_earned <= -TARGET:
                 st.warning("⛔ 今日虧損已達上限 $100，建議停止交易，明天再來")
             st.rerun()
