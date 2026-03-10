@@ -10022,9 +10022,355 @@ if not symbols:
         st.rerun()
     st.stop()
 
-# ── 📋 今日操作簡報（最頂部，全股票一覽）─────────────────────────────────────
-if show_briefing:
-    render_daily_briefing(symbols)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 💰 今天賺$100 模式
+# ══════════════════════════════════════════════════════════════════════════════
+
+def render_make_100_mode(symbols: list):
+    """
+    簡化模式：掃描所有股票，找出今日最佳一筆交易，
+    自動計算股數、目標、止損，讓用戶只需按一個鍵。
+    """
+    # ── session state 初始化 ──────────────────────────────────────────────
+    if "m100_account"    not in st.session_state: st.session_state.m100_account    = 10000.0
+    if "m100_earned"     not in st.session_state: st.session_state.m100_earned     = 0.0
+    if "m100_trade_done" not in st.session_state: st.session_state.m100_trade_done = False
+    if "m100_trade"      not in st.session_state: st.session_state.m100_trade      = None
+
+    TARGET = 100.0
+
+    # ── 頂部橫幅 ─────────────────────────────────────────────────────────
+    earned    = st.session_state.m100_earned
+    remaining = max(0.0, TARGET - earned)
+    progress  = min(1.0, earned / TARGET)
+    prog_pct  = int(progress * 100)
+    prog_col  = "#00ff88" if prog_pct >= 100 else "#ffcc44" if prog_pct >= 50 else "#44aaff"
+
+    st.markdown(
+        f'<div style="background:#060e06;border:2px solid #004422;'
+        f'border-radius:18px;padding:20px 26px;margin-bottom:20px;">'
+
+        f'<div style="display:flex;align-items:center;gap:16px;margin-bottom:14px;">'
+        f'<span style="font-size:2rem;">💰</span>'
+        f'<div>'
+        f'<div style="color:#00ee66;font-weight:900;font-size:1.5rem;">今天賺 $100</div>'
+        f'<div style="color:#336633;font-size:0.72rem;">系統已為你找出今日最佳一筆交易</div>'
+        f'</div>'
+        f'<div style="margin-left:auto;text-align:right;">'
+        f'<div style="color:{prog_col};font-weight:900;font-size:1.8rem;">${earned:.0f}</div>'
+        f'<div style="color:#334433;font-size:0.7rem;">今日已賺 / 目標 $100</div>'
+        f'</div></div>'
+
+        # 進度條
+        f'<div style="background:#0a1408;border-radius:8px;height:10px;overflow:hidden;">'
+        f'<div style="width:{prog_pct}%;height:10px;border-radius:8px;'
+        f'background:linear-gradient(90deg,#006633,{prog_col});'
+        f'transition:width 0.5s;"></div></div>'
+        f'<div style="display:flex;justify-content:space-between;'
+        f'font-size:0.65rem;color:#336633;margin-top:4px;">'
+        f'<span>$0</span><span style="color:{prog_col};">${earned:.0f} ({prog_pct}%)</span>'
+        f'<span>$100</span></div>'
+        f'</div>',
+        unsafe_allow_html=True)
+
+    # ── 已達成 ───────────────────────────────────────────────────────────
+    if st.session_state.m100_trade_done and earned >= TARGET:
+        st.markdown(
+            f'<div style="background:#020a02;border:2px solid #00ff88;'
+            f'border-radius:16px;padding:24px;text-align:center;margin-bottom:16px;">'
+            f'<div style="font-size:2.5rem;margin-bottom:8px;">🎉</div>'
+            f'<div style="color:#00ff88;font-weight:900;font-size:1.6rem;">今日目標達成！</div>'
+            f'<div style="color:#336633;margin-top:8px;font-size:0.85rem;">'
+            f'已賺 ${earned:.0f}　今天可以收手了，明天繼續</div>'
+            f'</div>',
+            unsafe_allow_html=True)
+        if st.button("🔄 重置（新的一天）", key="m100_reset"):
+            st.session_state.m100_earned     = 0.0
+            st.session_state.m100_trade_done = False
+            st.session_state.m100_trade      = None
+            st.rerun()
+        return
+
+    # ── 帳戶設定 ─────────────────────────────────────────────────────────
+    with st.expander("⚙️ 帳戶設定", expanded=False):
+        acct = st.number_input("帳戶總額 ($)", min_value=1000.0,
+                               max_value=500000.0,
+                               value=st.session_state.m100_account,
+                               step=1000.0, key="m100_acct_input")
+        st.session_state.m100_account = acct
+
+    acct = st.session_state.m100_account
+
+    # ── 掃描最佳機會 ─────────────────────────────────────────────────────
+    with st.spinner("🔍 掃描今日最佳機會..."):
+        best = None
+        best_score = -999
+
+        for sym in symbols:
+            try:
+                _df = fetch_data(sym, "5m")
+                if _df is None or _df.empty or len(_df) < 20:
+                    continue
+
+                _c   = _df["Close"]
+                _h   = _df["High"]
+                _l   = _df["Low"]
+                _v   = _df["Volume"]
+                _last= float(_c.iloc[-1])
+                _atr = float((_h - _l).rolling(14).mean().iloc[-1])
+                if _atr < 0.01: continue
+
+                # 評分
+                _sc = 0
+
+                # EMA方向
+                _e5  = float(_c.ewm(span=5).mean().iloc[-1])
+                _e10 = float(_c.ewm(span=10).mean().iloc[-1])
+                _e20 = float(_c.ewm(span=20).mean().iloc[-1])
+                if _e5 > _e10 > _e20:   _sc += 2
+                elif _e5 < _e10 < _e20: _sc -= 2
+
+                # MACD
+                _dif = float((_c.ewm(span=12).mean() - _c.ewm(span=26).mean()).iloc[-1])
+                _dea = float((_c.ewm(span=12).mean() - _c.ewm(span=26).mean()).ewm(span=9).mean().iloc[-1])
+                _dif_prev = float((_c.ewm(span=12).mean() - _c.ewm(span=26).mean()).iloc[-2])
+                if _dif > _dea: _sc += 1
+                if _dif > _dif_prev: _sc += 1   # DIF上升動能
+
+                # 盤整壓縮
+                if len(_df) >= 16:
+                    _w   = _df.iloc[-16:-1]
+                    _rng = float(_w["High"].max()) - float(_w["Low"].min())
+                    _compressed = _rng / max(_atr, 0.01) < 1.2
+                    if _compressed: _sc += 2   # 壓縮加分，突破潛力高
+
+                # 量能
+                _vol_now = float(_v.iloc[-1])
+                _vol_avg = float(_v.rolling(10).mean().iloc[-1])
+                if _vol_now > _vol_avg * 1.3: _sc += 1
+
+                # RSI
+                _delta = _c.diff()
+                _gain  = _delta.where(_delta > 0, 0).rolling(14).mean()
+                _loss  = (-_delta.where(_delta < 0, 0)).rolling(14).mean()
+                _rsi   = float((100 - 100 / (1 + _gain / _loss.replace(0, 1e-9))).iloc[-1])
+                if 40 <= _rsi <= 60: _sc += 1   # 中性RSI = 未超買超賣，空間大
+
+                # 方向確定性（分數需超過閾值才考慮）
+                if abs(_sc) < 3: continue
+
+                _dir   = "LONG" if _sc > 0 else "SHORT"
+                _entry = round(_last, 2)
+                _sl    = round(_last - _atr * 1.5, 2) if _dir == "LONG" else round(_last + _atr * 1.5, 2)
+                _tp    = round(_last + _atr * 2.0, 2) if _dir == "LONG" else round(_last - _atr * 2.0, 2)
+
+                # 計算需要幾股賺$100
+                _profit_per_share = abs(_tp - _entry)
+                if _profit_per_share < 0.01: continue
+                _shares_needed = int(TARGET / _profit_per_share) + 1
+                _cost          = _shares_needed * _entry
+                _max_loss      = _shares_needed * abs(_entry - _sl)
+
+                # 資金控管：最大虧損不超過帳戶2%
+                if _max_loss > acct * 0.02: continue
+                # 資金夠用
+                if _cost > acct * 0.95: continue
+
+                # 信心分（用絕對值+ATR大小加權）
+                _conf = abs(_sc) * 10 + min(20, _atr * 2)
+
+                if _conf > best_score:
+                    best_score = _conf
+                    best = {
+                        "sym":    sym,
+                        "dir":    _dir,
+                        "entry":  _entry,
+                        "sl":     _sl,
+                        "tp":     _tp,
+                        "shares": _shares_needed,
+                        "cost":   round(_cost, 0),
+                        "profit": round(_shares_needed * _profit_per_share, 0),
+                        "loss":   round(_max_loss, 0),
+                        "atr":    round(_atr, 2),
+                        "sc":     _sc,
+                        "conf":   int(min(99, 50 + _conf)),
+                        "rsi":    round(_rsi, 1),
+                        "compressed": _compressed if 'compressed' in dir() else False,
+                    }
+            except Exception:
+                continue
+
+    # ── 顯示最佳機會 ─────────────────────────────────────────────────────
+    if not best:
+        st.markdown(
+            '<div style="background:#0a0c10;border:1px solid #1a2030;border-radius:12px;'
+            'padding:20px;text-align:center;color:#445566;">'
+            '⌛ 目前市場條件不明確，建議等待更好的進場時機<br>'
+            '<span style="font-size:0.75rem;">通常開盤30分鐘後信號最清晰</span>'
+            '</div>',
+            unsafe_allow_html=True)
+        return
+
+    dc     = "#00ee66" if best["dir"] == "LONG" else "#ff5566"
+    di     = "🟢 做多" if best["dir"] == "LONG" else "🔴 做空"
+    sl_pct = abs(best["entry"] - best["sl"]) / best["entry"] * 100
+    tp_pct = abs(best["tp"]    - best["entry"]) / best["entry"] * 100
+
+    st.markdown(
+        f'<div style="background:#07100a;border:2px solid {dc}44;'
+        f'border-left:5px solid {dc};border-radius:16px;padding:22px 24px;'
+        f'margin-bottom:16px;">'
+
+        # 標題行
+        f'<div style="display:flex;align-items:center;gap:12px;margin-bottom:18px;">'
+        f'<span style="color:#ccddee;font-weight:900;font-size:1.8rem;">${best["sym"]}</span>'
+        f'<span style="background:{dc}22;color:{dc};border:1px solid {dc}55;'
+        f'border-radius:20px;padding:4px 14px;font-weight:700;font-size:1rem;">{di}</span>'
+        f'<span style="margin-left:auto;background:#001a00;color:#00ff88;'
+        f'border-radius:10px;padding:4px 12px;font-weight:700;font-size:0.9rem;">'
+        f'信心 {best["conf"]}%</span>'
+        f'</div>'
+
+        # 核心數字：4格
+        f'<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:18px;">'
+
+        f'<div style="background:#0a1418;border-radius:10px;padding:12px;text-align:center;">'
+        f'<div style="color:#445566;font-size:0.65rem;margin-bottom:6px;">進場價</div>'
+        f'<div style="color:#aabbff;font-weight:800;font-size:1.2rem;">${best["entry"]:.2f}</div>'
+        f'</div>'
+
+        f'<div style="background:#1a0808;border-radius:10px;padding:12px;text-align:center;">'
+        f'<div style="color:#445566;font-size:0.65rem;margin-bottom:6px;">止損</div>'
+        f'<div style="color:#ff5566;font-weight:800;font-size:1.2rem;">${best["sl"]:.2f}</div>'
+        f'<div style="color:#663333;font-size:0.68rem;">-{sl_pct:.1f}%</div>'
+        f'</div>'
+
+        f'<div style="background:#081a08;border-radius:10px;padding:12px;text-align:center;">'
+        f'<div style="color:#445566;font-size:0.65rem;margin-bottom:6px;">目標</div>'
+        f'<div style="color:#44ee66;font-weight:800;font-size:1.2rem;">${best["tp"]:.2f}</div>'
+        f'<div style="color:#336633;font-size:0.68rem;">+{tp_pct:.1f}%</div>'
+        f'</div>'
+
+        f'<div style="background:#0a1200;border-radius:10px;padding:12px;text-align:center;">'
+        f'<div style="color:#445566;font-size:0.65rem;margin-bottom:6px;">買入股數</div>'
+        f'<div style="color:#00ffaa;font-weight:800;font-size:1.2rem;">{best["shares"]}股</div>'
+        f'<div style="color:#336633;font-size:0.68rem;">${best["cost"]:.0f}</div>'
+        f'</div>'
+        f'</div>'
+
+        # 盈虧預覽
+        f'<div style="display:flex;gap:10px;margin-bottom:16px;">'
+        f'<div style="flex:1;background:#010f01;border:1px solid #00882244;'
+        f'border-radius:8px;padding:10px;text-align:center;">'
+        f'<div style="color:#336633;font-size:0.65rem;margin-bottom:4px;">達標獲利</div>'
+        f'<div style="color:#00ff88;font-weight:900;font-size:1.5rem;">+${best["profit"]:.0f}</div>'
+        f'</div>'
+        f'<div style="flex:1;background:#0f0101;border:1px solid #ff222244;'
+        f'border-radius:8px;padding:10px;text-align:center;">'
+        f'<div style="color:#663333;font-size:0.65rem;margin-bottom:4px;">最大虧損</div>'
+        f'<div style="color:#ff4455;font-weight:900;font-size:1.5rem;">-${best["loss"]:.0f}</div>'
+        f'</div>'
+        f'<div style="flex:1;background:#020808;border:1px solid #44aaff44;'
+        f'border-radius:8px;padding:10px;text-align:center;">'
+        f'<div style="color:#334455;font-size:0.65rem;margin-bottom:4px;">風險報酬</div>'
+        f'<div style="color:#44aaff;font-weight:900;font-size:1.5rem;">'
+        f'{best["profit"]/max(best["loss"],1):.1f}:1</div>'
+        f'</div>'
+        f'</div>'
+
+        + (f'<div style="background:#141000;border-radius:6px;padding:8px 12px;margin-bottom:12px;">'
+           f'<span style="color:#ffcc44;font-size:0.75rem;">🔲 均線高度壓縮，突破後加速概率高</span>'
+           f'</div>' if best.get("compressed") else '')
+
+        + f'<div style="color:#334455;font-size:0.65rem;">'
+        f'ATR={best["atr"]} · RSI={best["rsi"]} · 評分={best["sc"]:+d}</div>'
+        f'</div>',
+        unsafe_allow_html=True)
+
+    # ── 操作按鈕 ─────────────────────────────────────────────────────────
+    col_ok, col_skip, col_win, col_lose = st.columns(4)
+
+    with col_ok:
+        if st.button("✅ 我知道了，準備進場", key="m100_confirm",
+                     use_container_width=True):
+            st.session_state.m100_trade = best
+            st.toast(f"✅ 已記錄：{best['sym']} {di}，目標 +${best['profit']:.0f}")
+
+    with col_skip:
+        if st.button("⏭ 跳過，找下一個", key="m100_skip",
+                     use_container_width=True):
+            # 把這個股票暫時排除（加到 skip list）
+            if "m100_skip_list" not in st.session_state:
+                st.session_state.m100_skip_list = set()
+            st.session_state.m100_skip_list.add(best["sym"])
+            st.rerun()
+
+    with col_win:
+        if st.button(f"🎯 達標 +${best['profit']:.0f}", key="m100_win",
+                     use_container_width=True):
+            st.session_state.m100_earned += best["profit"]
+            st.session_state.m100_trade_done = True
+            st.session_state.m100_trade      = None
+            st.rerun()
+
+    with col_lose:
+        if st.button(f"❌ 止損 -${best['loss']:.0f}", key="m100_lose",
+                     use_container_width=True):
+            st.session_state.m100_earned -= best["loss"]
+            st.session_state.m100_trade   = None
+            if st.session_state.m100_earned <= -TARGET:
+                st.warning("⛔ 今日虧損已達上限 $100，建議停止交易，明天再來")
+            st.rerun()
+
+    # ── 風控提醒 ─────────────────────────────────────────────────────────
+    st.markdown(
+        '<div style="background:#080808;border-radius:8px;padding:10px 14px;'
+        'margin-top:12px;color:#334455;font-size:0.7rem;">'
+        '⚠️ 風控提醒：達到 $100 目標後立即收手 · '
+        '止損後不要加倍報復性交易 · '
+        '每日最大虧損上限 $100</div>',
+        unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 💰 今天賺$100 按鈕入口（最頂部）
+# ══════════════════════════════════════════════════════════════════════════════
+if "m100_mode" not in st.session_state:
+    st.session_state.m100_mode = False
+
+_col_btn, _col_status = st.columns([2, 3])
+with _col_btn:
+    if not st.session_state.m100_mode:
+        if st.button("💰 今天賺 $100", key="m100_enter",
+                     use_container_width=True,
+                     help="系統自動掃描最佳機會，計算股數、進場、止損、目標"):
+            st.session_state.m100_mode = True
+            st.rerun()
+    else:
+        if st.button("✖ 返回完整模式", key="m100_exit",
+                     use_container_width=True):
+            st.session_state.m100_mode = False
+            st.rerun()
+
+with _col_status:
+    if st.session_state.m100_mode:
+        _earned = st.session_state.get("m100_earned", 0)
+        _pct    = min(100, int(_earned / 1.0))
+        _sc_col = "#00ff88" if _earned >= 100 else "#ffcc44" if _earned > 0 else "#445566"
+        st.markdown(
+            f'<div style="padding:6px 0;color:{_sc_col};font-size:0.85rem;font-weight:600;">'
+            f'💰 今日已賺 ${_earned:.0f} / $100</div>',
+            unsafe_allow_html=True)
+
+st.markdown("---")
+
+# 💰 模式分支
+if st.session_state.m100_mode:
+    render_make_100_mode(symbols)
+    st.stop()   # 不顯示其他內容，保持簡潔
+
+
 
 # ── 市場環境面板（置頂）──────────────────────────────────────────────────────
 if show_market:
