@@ -8185,6 +8185,188 @@ def run_alerts(symbol, period_label, df, trigger_ai=False, mkt=None):
         except Exception:
             pass
 
+        # ══════════════════════════════════════════════════════════════════════
+        # S節：盤整區間偵測 + 突破預警系統
+        # 自動劃出上下邊界 → 監控放量突破 → 配合VIX+背景方向給信心度
+        # ══════════════════════════════════════════════════════════════════════
+        try:
+            if len(df) >= 15 and "High" in df.columns:
+                # ── S1. 壓縮盤整區間偵測 ────────────────────────────────────
+                # 邏輯：找最近 N 根K線（排除最後1根）的最高/最低
+                # 若(最高-最低)/ATR < 壓縮閾值 → 確認盤整
+                _s_lookback = min(30, len(df) - 1)
+                _s_window   = df.iloc[-_s_lookback-1:-1]   # 排除最後1根
+
+                _s_hi   = float(_s_window["High"].max())
+                _s_lo   = float(_s_window["Low"].min())
+                _s_rng  = _s_hi - _s_lo
+                _s_atr  = float((high - low).rolling(14).mean().iloc[-2])  # 用前一根ATR
+                _s_rng_atr_ratio = _s_rng / max(_s_atr, 0.01)
+
+                # 壓縮閾值：區間寬度 < 1.2×ATR = 高度壓縮
+                _s_compressed = _s_rng_atr_ratio < 1.2
+
+                # 還需要確認K線密集在區間中段（非趨勢行進）
+                # 用收盤價標準差 vs ATR 來判斷
+                _s_close_std = float(_s_window["Close"].std())
+                _s_tight = _s_close_std / max(_s_atr, 0.01) < 0.35
+
+                _s_ts = df.index[-1].strftime('%Y%m%d%H%M') if hasattr(df.index[-1],'strftime') else str(df.index[-1])[:16]
+                _s_date = _s_ts[:8]
+
+                # ── S2. 突破偵測（最新根K線放量突破邊界）──────────────────
+                _s_curr      = float(close.iloc[-1])
+                _s_prev      = float(close.iloc[-2])
+                _s_curr_h    = float(high.iloc[-1])
+                _s_curr_l    = float(low.iloc[-1])
+                _s_vol_now   = float(vol.iloc[-1])
+                _s_vol_avg   = float(vol.rolling(10).mean().iloc[-1])
+                _s_vol_surge = _s_vol_now > _s_vol_avg * 1.3   # 放量閾值
+
+                # 突破確認：收盤站上/穿破邊界 + 量能配合
+                _s_break_up   = (_s_curr > _s_hi * 1.002 and
+                                 _s_prev <= _s_hi and _s_vol_surge)
+                _s_break_down = (_s_curr < _s_lo * 0.998 and
+                                 _s_prev >= _s_lo and _s_vol_surge)
+
+                # 即將突破（收盤在邊界±0.15%內，量能開始放大）
+                _s_near_break_up   = (abs(_s_curr - _s_hi) / _s_hi < 0.0015 and
+                                      _s_vol_now > _s_vol_avg * 1.1)
+                _s_near_break_down = (abs(_s_curr - _s_lo) / _s_lo < 0.0015 and
+                                      _s_vol_now > _s_vol_avg * 1.1)
+
+                if _s_compressed and _s_tight:
+                    # ── S3. 取得背景方向（日K EMA排列 → 決定突破偏向）────
+                    try:
+                        _s_daily = yf.download(symbol, period="60d", interval="1d",
+                                               auto_adjust=True, progress=False)
+                        if isinstance(_s_daily.columns, pd.MultiIndex):
+                            _s_daily.columns = [c[0] for c in _s_daily.columns]
+                        _s_d_close = _s_daily["Close"].dropna()
+                        _s_e20d = float(_s_d_close.ewm(span=20).mean().iloc[-1])
+                        _s_e60d = float(_s_d_close.ewm(span=60).mean().iloc[-1])
+                        _s_e200d= float(_s_d_close.ewm(span=200).mean().iloc[-1])
+                        _s_daily_price = float(_s_d_close.iloc[-1])
+                        if _s_daily_price > _s_e20d > _s_e60d > _s_e200d:
+                            _s_bg_dir = "bull"; _s_bg_label = "日K全EMA多頭排列"
+                        elif _s_daily_price < _s_e20d < _s_e60d < _s_e200d:
+                            _s_bg_dir = "bear"; _s_bg_label = "日K全EMA空頭排列"
+                        else:
+                            _s_bg_dir = "neutral"; _s_bg_label = "日K震盪"
+                    except Exception:
+                        _s_bg_dir = "neutral"; _s_bg_label = "背景未知"
+
+                    # ── S4. VIX即時方向 ────────────────────────────────────
+                    try:
+                        _s_vix = fetch_vix_intraday()
+                        _s_vix_bull = _s_vix.get("signal", 0) > 0   # VIX下行
+                        _s_vix_bear = _s_vix.get("signal", 0) < 0   # VIX上行
+                        _s_vix_val  = _s_vix.get("spot", None)
+                        _s_vix_note = f"VIX={_s_vix_val:.1f}" if _s_vix_val else "VIX未知"
+                    except Exception:
+                        _s_vix_bull = False; _s_vix_bear = False
+                        _s_vix_note = "VIX未知"
+
+                    # ── 盤整區間提示（尚未突破，僅提示壓縮）──────────────
+                    _s_compress_ck = f"{symbol}|{period_label}|盤整壓縮|{_s_date}"
+                    if _s_compress_ck not in st.session_state.sent_alerts:
+                        st.session_state.sent_alerts.add(_s_compress_ck)
+                        _s_conf_pct = int((1 - _s_rng_atr_ratio / 1.2) * 100)
+                        _s_bias = ("偏多突破" if _s_bg_dir == "bull"
+                                   else "偏空突破" if _s_bg_dir == "bear"
+                                   else "方向待定")
+                        add_alert(symbol, period_label,
+                                  f"🔲 【S1·盤整壓縮{_conf_pct}%】近{_s_lookback}根K線"
+                                  f"區間${_s_lo:.2f}–${_s_hi:.2f}（寬{_s_rng:.2f}={_s_rng_atr_ratio:.1f}×ATR）"
+                                  f"｜{_s_bg_label}背景→{_s_bias}"
+                                  f"｜{_s_vix_note}"
+                                  f"｜等待放量突破確認方向！", "info")
+                        new_signals.append(f"S1-盤整壓縮{_s_rng_atr_ratio:.1f}xATR")
+                        # 建立進場追蹤（預備狀態）
+                        if _s_bg_dir == "bull":
+                            add_entry_tracker(symbol, "LONG",
+                                              f"S1-盤整壓縮等突破上邊界${_s_hi:.2f}",
+                                              _s_hi, period_label)
+                        elif _s_bg_dir == "bear":
+                            add_entry_tracker(symbol, "SHORT",
+                                              f"S1-盤整壓縮等突破下邊界${_s_lo:.2f}",
+                                              _s_lo, period_label)
+
+                    # ── 即將突破警告 ────────────────────────────────────────
+                    if _s_near_break_up and not _s_break_up:
+                        _ck = f"{symbol}|{period_label}|即將突破上|{_s_ts}"
+                        if _ck not in st.session_state.sent_alerts:
+                            st.session_state.sent_alerts.add(_ck)
+                            _conf = 70 + (15 if _s_bg_dir=="bull" else 0) + (10 if _s_vix_bull else 0)
+                            add_alert(symbol, period_label,
+                                      f"⚡ 【S2·即將突破上邊界】現價${_s_curr:.2f}逼近阻力${_s_hi:.2f}"
+                                      f"（距離{(_s_hi-_s_curr)/_s_hi*100:.2f}%）量{_s_vol_now/_s_vol_avg:.1f}×放大"
+                                      f"｜{_s_bg_label}+{_s_vix_note}｜突破信心{_conf}%"
+                                      f"｜突破目標：${_s_hi+_s_rng:.2f}（+{_s_rng/_s_hi*100:.1f}%）", "bull")
+                            new_signals.append(f"S2-即將突破上${_s_hi:.2f}")
+
+                    if _s_near_break_down and not _s_break_down:
+                        _ck = f"{symbol}|{period_label}|即將突破下|{_s_ts}"
+                        if _ck not in st.session_state.sent_alerts:
+                            st.session_state.sent_alerts.add(_ck)
+                            _conf = 70 + (15 if _s_bg_dir=="bear" else 0) + (10 if _s_vix_bear else 0)
+                            add_alert(symbol, period_label,
+                                      f"⚡ 【S2·即將跌破下邊界】現價${_s_curr:.2f}逼近支撐${_s_lo:.2f}"
+                                      f"（距離{(_s_curr-_s_lo)/_s_lo*100:.2f}%）量{_s_vol_now/_s_vol_avg:.1f}×放大"
+                                      f"｜{_s_bg_label}+{_s_vix_note}｜跌破信心{_conf}%"
+                                      f"｜跌破目標：${_s_lo-_s_rng:.2f}（-{_s_rng/_s_lo*100:.1f}%）", "bear")
+                            new_signals.append(f"S2-即將跌破下${_s_lo:.2f}")
+
+                    # ── 突破確認（最高置信）────────────────────────────────
+                    if _s_break_up:
+                        _ck = f"{symbol}|{period_label}|突破確認上|{_s_ts}"
+                        if _ck not in st.session_state.sent_alerts:
+                            st.session_state.sent_alerts.add(_ck)
+                            _conf = 80 + (15 if _s_bg_dir=="bull" else -10) + (10 if _s_vix_bull else 0)
+                            _target1 = _s_hi + _s_rng          # 目標1：區間等幅投射
+                            _target2 = _s_hi + _s_rng * 2.0    # 目標2：2倍
+                            _sl      = _s_hi - _s_atr * 0.5    # 止損：突破點下方半個ATR
+                            add_alert(symbol, period_label,
+                                      f"🚀🚀 【S3·盤整突破確認·多頭】收盤${_s_curr:.2f}放量突破"
+                                      f"盤整上邊界${_s_hi:.2f}（量{_s_vol_now/_s_vol_avg:.1f}×）"
+                                      f"｜{_s_bg_label}+{_s_vix_note}"
+                                      f"｜信心{_conf}%"
+                                      f"｜目標①${_target1:.2f} 目標②${_target2:.2f}"
+                                      f"｜止損${_sl:.2f}", "bull")
+                            new_signals.append(f"S3-盤整突破上確認${_s_curr:.2f}")
+                            generate_trade_suggestion(symbol, period_label,
+                                                      f"S3-盤整突破上${_s_hi:.2f}",
+                                                      "bull", _s_curr, _s_atr)
+                            add_entry_tracker(symbol, "LONG",
+                                              f"S3-盤整突破上${_s_hi:.2f}",
+                                              _s_curr, period_label, atr=_s_atr)
+
+                    elif _s_break_down:
+                        _ck = f"{symbol}|{period_label}|突破確認下|{_s_ts}"
+                        if _ck not in st.session_state.sent_alerts:
+                            st.session_state.sent_alerts.add(_ck)
+                            _conf = 80 + (15 if _s_bg_dir=="bear" else -10) + (10 if _s_vix_bear else 0)
+                            _target1 = _s_lo - _s_rng
+                            _target2 = _s_lo - _s_rng * 2.0
+                            _sl      = _s_lo + _s_atr * 0.5
+                            add_alert(symbol, period_label,
+                                      f"💥💥 【S3·盤整跌破確認·空頭】收盤${_s_curr:.2f}放量跌破"
+                                      f"盤整下邊界${_s_lo:.2f}（量{_s_vol_now/_s_vol_avg:.1f}×）"
+                                      f"｜{_s_bg_label}+{_s_vix_note}"
+                                      f"｜信心{_conf}%"
+                                      f"｜目標①${_target1:.2f} 目標②${_target2:.2f}"
+                                      f"｜止損${_sl:.2f}", "bear")
+                            new_signals.append(f"S3-盤整跌破下確認${_s_curr:.2f}")
+                            generate_trade_suggestion(symbol, period_label,
+                                                      f"S3-盤整跌破下${_s_lo:.2f}",
+                                                      "bear", _s_curr, _s_atr)
+                            add_entry_tracker(symbol, "SHORT",
+                                              f"S3-盤整跌破下${_s_lo:.2f}",
+                                              _s_curr, period_label, atr=_s_atr)
+
+        except Exception:
+            pass
+
     except Exception:
         pass
         return
@@ -8716,15 +8898,69 @@ def build_chart(symbol, df, interval_label, compact=False, max_bars=90, ext_data
     fig.update_yaxes(showgrid=True, gridcolor="#1a1e30",
                      tickfont=dict(size=9 if compact else 10))
 
+    # ── 盤整區間視覺化（上下邊界橫線 + 半透明填色）──────────────────────────
+    try:
+        if len(df) >= 15:
+            _cz_lookback = min(30, len(df) - 1)
+            _cz_window   = df.iloc[-_cz_lookback-1:-1]
+            _cz_hi   = float(_cz_window["High"].max())
+            _cz_lo   = float(_cz_window["Low"].min())
+            _cz_rng  = _cz_hi - _cz_lo
+            _cz_atr  = float((df["High"] - df["Low"]).rolling(14).mean().iloc[-2])
+            _cz_ratio = _cz_rng / max(_cz_atr, 0.01)
+            _cz_std  = float(_cz_window["Close"].std())
+            _cz_compressed = _cz_ratio < 1.2 and _cz_std / max(_cz_atr, 0.01) < 0.35
+
+            if _cz_compressed:
+                # 上邊界橫線（阻力）
+                fig.add_hline(
+                    y=_cz_hi, row=1, col=1,
+                    line=dict(color="#ffcc44", width=1.5, dash="dot"),
+                    annotation_text=f"盤整上界 ${_cz_hi:.2f}",
+                    annotation_position="right",
+                    annotation_font=dict(color="#ffcc44", size=9),
+                )
+                # 下邊界橫線（支撐）
+                fig.add_hline(
+                    y=_cz_lo, row=1, col=1,
+                    line=dict(color="#44aaff", width=1.5, dash="dot"),
+                    annotation_text=f"盤整下界 ${_cz_lo:.2f}",
+                    annotation_position="right",
+                    annotation_font=dict(color="#44aaff", size=9),
+                )
+                # 半透明填色區間
+                fig.add_hrect(
+                    y0=_cz_lo, y1=_cz_hi,
+                    fillcolor="rgba(255,200,50,0.04)",
+                    line_width=0, row=1, col=1,
+                )
+                # 寬度標注
+                fig.add_annotation(
+                    x=xlabels[-int(len(xlabels)*0.15)],
+                    y=(_cz_hi + _cz_lo) / 2,
+                    text=f"⟺ 盤整 {_cz_ratio:.1f}×ATR",
+                    showarrow=False,
+                    font=dict(color="#998833", size=8),
+                    bgcolor="rgba(20,15,0,0.7)",
+                    bordercolor="#665500",
+                    borderwidth=1,
+                    borderpad=3,
+                    row=1, col=1,
+                )
+    except Exception:
+        pass
+
     # ── 高置信信號進場箭頭標記（來自 alert_log）────────────────────────────
     # 在K線圖上標記 F6/F7/F8/F9/K18/K19/全EMA排列/R1/R2 等高置信信號
     try:
         HIGH_SIG_BULL = ("F7", "F8", "K18", "全EMA多頭排列", "早晨之星",
                          "R1-量價齊升", "R2-突破前波高", "R1-價跌量縮",
-                         "均線聚合後突破", "K12-看漲吞噬", "三白兵")
+                         "均線聚合後突破", "K12-看漲吞噬", "三白兵",
+                         "S3-盤整突破上")
         HIGH_SIG_BEAR = ("F6", "F9", "K19", "全EMA空頭排列", "黃昏之星",
                          "R1-價漲量縮", "R2-跌破前波低",
-                         "K13-看跌吞噬", "三黑鴉")
+                         "K13-看跌吞噬", "三黑鴉",
+                         "S3-盤整跌破下")
 
         _log = st.session_state.get("alert_log", [])
         # 只取本圖表 symbol 的日K/週K訊號（避免5分鐘噪音）
@@ -9771,6 +10007,9 @@ if st.session_state.alert_log:
             "深谷金叉": 6,  "MACD金叉": 5,               # MACD
             "MACD死叉": 5,  "底部金叉": 5,               # MACD
             "均線聚合後突破": 6, "均線壓縮": 4,           # 均線形態
+            "S3-盤整突破上": 9, "S3-盤整跌破下": 9,      # 盤整突破確認（高置信）
+            "S2-即將突破上": 6, "S2-即將跌破下": 6,      # 即將突破預警
+            "S1-盤整壓縮":  4,                            # 盤整壓縮提示
             "關鍵阻力": 4,  "關鍵支撐": 4,               # 關鍵位
             "K10-大陽線": 5, "K11-大陰線": 5,            # 大K
             "K01-錘頭線": 4, "K02-吊頸線": 4,            # 單K反轉
