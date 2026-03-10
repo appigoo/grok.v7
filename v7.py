@@ -9794,6 +9794,7 @@ def render_single(symbol, interval, show_alerts, max_bars=90, show_pre=False, sh
     c2.metric("成交量（萬股）", f"{vol_now/10000:.1f}")
     c3.metric("本K最高",       f"${df['High'].iloc[-1]:.2f}")
     c4.metric("本K最低",       f"${df['Low'].iloc[-1]:.2f}")
+    t_cls  = {"多頭":"trend-bull","空頭":"trend-bear","盤整":"trend-side"}[trend]
     t_icon = {"多頭":"▲","空頭":"▼","盤整":"◆"}[trend]
     with c5:
         st.markdown(
