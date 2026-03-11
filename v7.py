@@ -10064,17 +10064,16 @@ def render_make_100_mode(symbols: list):
     prog_pct  = int(progress * 100)
     prog_col  = "#00ff88" if prog_pct >= 100 else "#ffcc44" if prog_pct >= 50 else "#44aaff"
 
-    # 倒計時計算
+    # ── 倒計時參數傳給 JS ─────────────────────────────────────────────────
     _last_scan = st.session_state.m100_last_scan
     if _last_scan:
-        _elapsed  = (_now_ts - _last_scan).total_seconds()
-        _next_sec = max(0, int(SCAN_INTERVAL - _elapsed))
-        _scan_label = (f"🔒 已鎖定機會" if _locked
-                       else f"🔄 {_next_sec}秒後更新" if _next_sec > 0
-                       else "🔍 掃描中...")
-        _scan_color = "#44aaff" if _locked else "#ffcc44" if _next_sec > 10 else "#ff8844"
+        _elapsed      = (_now_ts - _last_scan).total_seconds()
+        _next_sec     = max(0, int(SCAN_INTERVAL - _elapsed))
     else:
-        _scan_label = "🔍 首次掃描中..."; _scan_color = "#ffcc44"
+        _next_sec = 0
+
+    _js_locked    = "true" if _locked else "false"
+    _js_next_sec  = _next_sec
 
     st.markdown(
         f'<div style="background:#060e06;border:2px solid #004422;'
@@ -10084,7 +10083,8 @@ def render_make_100_mode(symbols: list):
         f'<span style="font-size:2rem;">💰</span>'
         f'<div>'
         f'<div style="color:#00ee66;font-weight:900;font-size:1.5rem;">今天賺 $100</div>'
-        f'<div style="color:{_scan_color};font-size:0.72rem;">{_scan_label}</div>'
+        # JS 即時倒計時標籤
+        f'<div id="m100_status" style="font-size:0.72rem;font-weight:600;">🔍 掃描中...</div>'
         f'</div>'
         f'<div style="margin-left:auto;text-align:right;">'
         f'<div style="color:{prog_col};font-weight:900;font-size:1.8rem;">${earned:.0f}</div>'
@@ -10100,7 +10100,36 @@ def render_make_100_mode(symbols: list):
         f'font-size:0.65rem;color:#336633;margin-top:4px;">'
         f'<span>$0</span><span style="color:{prog_col};">${earned:.0f} ({prog_pct}%)</span>'
         f'<span>$100</span></div>'
-        f'</div>',
+        f'</div>'
+
+        # JS 倒計時腳本
+        f'''<script>
+(function() {{
+  var locked   = {_js_locked};
+  var secs     = {_js_next_sec};
+  var el       = document.getElementById("m100_status");
+  if (!el) return;
+
+  function update() {{
+    if (locked) {{
+      el.style.color = "#44aaff";
+      el.innerText   = "🔒 已鎖定機會，等待你進場";
+      return;
+    }}
+    if (secs <= 0) {{
+      el.style.color = "#ffcc44";
+      el.innerText   = "🔍 掃描中...";
+      return;
+    }}
+    var col = secs <= 10 ? "#ff8844" : "#ffcc44";
+    el.style.color = col;
+    el.innerText   = "🔄 " + secs + " 秒後更新掃描";
+    secs--;
+    setTimeout(update, 1000);
+  }}
+  update();
+}})();
+</script>''',
         unsafe_allow_html=True)
 
     # ── 已達成 ───────────────────────────────────────────────────────────
