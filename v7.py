@@ -10476,7 +10476,7 @@ if st.session_state.m100_mode:
     # ── 5分鐘自動重新掃描（倒計時顯示）─────────────────────────────────
     M100_REFRESH_SEC = 300   # 5分鐘
 
-    if "m100_last_scan" not in st.session_state:
+    if "m100_last_scan" not in st.session_state or not isinstance(st.session_state.m100_last_scan, float):
         st.session_state.m100_last_scan = time.time()
 
     _elapsed  = int(time.time() - st.session_state.m100_last_scan)
