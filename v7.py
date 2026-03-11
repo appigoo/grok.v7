@@ -10038,24 +10038,29 @@ def render_make_100_mode(symbols: list):
     if "m100_trade_done" not in st.session_state: st.session_state.m100_trade_done = False
     if "m100_trade"      not in st.session_state: st.session_state.m100_trade      = None
     if "m100_last_scan"  not in st.session_state: st.session_state.m100_last_scan  = None
-    if "m100_locked"     not in st.session_state: st.session_state.m100_locked     = False  # 找到後鎖定
+    if "m100_locked"     not in st.session_state: st.session_state.m100_locked     = False
     if "m100_best_cache" not in st.session_state: st.session_state.m100_best_cache = None
 
-    SCAN_INTERVAL = 60   # 每60秒掃描一次
+    # 強制確保 m100_last_scan 是 float（修復舊 session datetime 衝突）
+    if st.session_state.m100_last_scan is not None and not isinstance(st.session_state.m100_last_scan, float):
+        st.session_state.m100_last_scan = None
+
+    SCAN_INTERVAL = 300   # 5分鐘
     TARGET = 100.0
 
     # ── 判斷是否需要重新掃描 ─────────────────────────────────────────────
-    _now_ts    = datetime.now()
+    _now_ts    = time.time()
     _last_scan = st.session_state.m100_last_scan
     _locked    = st.session_state.m100_locked
     _need_scan = (
-        not _locked and (                         # 未鎖定才掃描
+        not _locked and (
         _last_scan is None or
-        (_now_ts - _last_scan).total_seconds() >= SCAN_INTERVAL)
+        (_now_ts - _last_scan) >= SCAN_INTERVAL)
     )
     if _need_scan:
         st.session_state.m100_last_scan  = _now_ts
-        st.session_state.m100_best_cache = None   # 清除快取，強制重掃
+        st.session_state.m100_best_cache = None
+        st.cache_data.clear()
 
     # ── 頂部橫幅 ─────────────────────────────────────────────────────────
     earned    = st.session_state.m100_earned
@@ -10064,16 +10069,16 @@ def render_make_100_mode(symbols: list):
     prog_pct  = int(progress * 100)
     prog_col  = "#00ff88" if prog_pct >= 100 else "#ffcc44" if prog_pct >= 50 else "#44aaff"
 
-    # ── 倒計時參數傳給 JS ─────────────────────────────────────────────────
+    # ── 倒計時參數 ────────────────────────────────────────────────────────
     _last_scan = st.session_state.m100_last_scan
     if _last_scan:
-        _elapsed      = (_now_ts - _last_scan).total_seconds()
-        _next_sec     = max(0, int(SCAN_INTERVAL - _elapsed))
+        _elapsed  = _now_ts - _last_scan
+        _next_sec = max(0, int(SCAN_INTERVAL - _elapsed))
     else:
         _next_sec = 0
 
-    _js_locked    = "true" if _locked else "false"
-    _js_next_sec  = _next_sec
+    _js_locked   = "true" if _locked else "false"
+    _js_next_sec = _next_sec
 
     import streamlit.components.v1 as _components
 
@@ -10436,6 +10441,25 @@ border-radius:18px;padding:20px 26px;margin-bottom:4px;font-family:sans-serif;">
         '每日最大虧損上限 $100</div>',
         unsafe_allow_html=True)
 
+    # ── 倒計時顯示 ────────────────────────────────────────────────────────
+    _scan_elapsed = int(time.time() - st.session_state.m100_last_scan) if st.session_state.m100_last_scan else 0
+    _scan_remain  = max(0, 300 - _scan_elapsed)
+    _scan_rm      = _scan_remain // 60
+    _scan_rs      = _scan_remain % 60
+    _scan_prog    = min(100, int(_scan_elapsed / 300 * 100))
+    st.markdown(
+        f'<div style="background:#060a06;border:1px solid #1a2a1a;'
+        f'border-radius:10px;padding:8px 14px;margin-top:10px;">'
+        f'<div style="display:flex;align-items:center;gap:10px;">'
+        f'<span style="color:#336633;font-size:0.68rem;">🔄 下次掃描</span>'
+        f'<div style="flex:1;background:#0a100a;border-radius:3px;height:4px;">'
+        f'<div style="width:{_scan_prog}%;height:4px;border-radius:3px;'
+        f'background:#224422;"></div></div>'
+        f'<span style="color:#44aa44;font-weight:700;font-size:0.78rem;'
+        f'font-family:monospace;">{_scan_rm:02d}:{_scan_rs:02d}</span>'
+        f'</div></div>',
+        unsafe_allow_html=True)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 💰 今天賺$100 按鈕入口（最頂部）
@@ -10472,41 +10496,9 @@ st.markdown("---")
 # 💰 模式分支
 if st.session_state.m100_mode:
     render_make_100_mode(symbols)
-
-    # ── 5分鐘自動重新掃描（倒計時顯示）─────────────────────────────────
-    M100_REFRESH_SEC = 300   # 5分鐘
-
-    if "m100_last_scan" not in st.session_state or not isinstance(st.session_state.m100_last_scan, float):
-        st.session_state.m100_last_scan = time.time()
-
-    _elapsed  = int(time.time() - st.session_state.m100_last_scan)
-    _remain   = max(0, M100_REFRESH_SEC - _elapsed)
-    _remain_m = _remain // 60
-    _remain_s = _remain % 60
-    _prog_pct = int((_elapsed / M100_REFRESH_SEC) * 100)
-
-    st.markdown(
-        f'<div style="background:#060a06;border:1px solid #1a2a1a;'
-        f'border-radius:10px;padding:10px 16px;margin-top:12px;">'
-        f'<div style="display:flex;align-items:center;gap:12px;">'
-        f'<span style="color:#336633;font-size:0.72rem;">🔄 下次掃描</span>'
-        f'<div style="flex:1;background:#0a100a;border-radius:4px;height:5px;">'
-        f'<div style="width:{_prog_pct}%;height:5px;border-radius:4px;'
-        f'background:#224422;"></div></div>'
-        f'<span style="color:#44aa44;font-weight:700;font-size:0.8rem;'
-        f'font-family:monospace;">{_remain_m:02d}:{_remain_s:02d}</span>'
-        f'</div></div>',
-        unsafe_allow_html=True)
-
-    # 到時間 → 清快取重新掃描
-    if _remain <= 0:
-        st.session_state.m100_last_scan = time.time()
-        st.cache_data.clear()
-        st.rerun()
-    else:
-        time.sleep(1)
-        st.rerun()
-
+    # 每秒 rerun 驅動倒計時；到時間由 render_make_100_mode 內部重置並重掃
+    time.sleep(1)
+    st.rerun()
     st.stop()
 
 
