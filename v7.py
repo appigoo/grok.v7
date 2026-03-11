@@ -10441,24 +10441,59 @@ border-radius:18px;padding:20px 26px;margin-bottom:4px;font-family:sans-serif;">
         '每日最大虧損上限 $100</div>',
         unsafe_allow_html=True)
 
-    # ── 倒計時顯示 ────────────────────────────────────────────────────────
+    # ── 倒計時顯示（純 JS，不閃動）─────────────────────────────────────
     _scan_elapsed = int(time.time() - st.session_state.m100_last_scan) if st.session_state.m100_last_scan else 0
     _scan_remain  = max(0, 300 - _scan_elapsed)
-    _scan_rm      = _scan_remain // 60
-    _scan_rs      = _scan_remain % 60
-    _scan_prog    = min(100, int(_scan_elapsed / 300 * 100))
-    st.markdown(
-        f'<div style="background:#060a06;border:1px solid #1a2a1a;'
-        f'border-radius:10px;padding:8px 14px;margin-top:10px;">'
-        f'<div style="display:flex;align-items:center;gap:10px;">'
-        f'<span style="color:#336633;font-size:0.68rem;">🔄 下次掃描</span>'
-        f'<div style="flex:1;background:#0a100a;border-radius:3px;height:4px;">'
-        f'<div style="width:{_scan_prog}%;height:4px;border-radius:3px;'
-        f'background:#224422;"></div></div>'
-        f'<span style="color:#44aa44;font-weight:700;font-size:0.78rem;'
-        f'font-family:monospace;">{_scan_rm:02d}:{_scan_rs:02d}</span>'
-        f'</div></div>',
-        unsafe_allow_html=True)
+
+    # 只在需要重新掃描時才觸發 rerun（避免每秒閃動）
+    _rescan_col = st.empty()
+    if _scan_remain <= 0:
+        with _rescan_col:
+            if st.button("🔄 重新掃描", key="m100_auto_rescan", help="5分鐘到，自動重新掃描"):
+                st.session_state.m100_last_scan  = None
+                st.session_state.m100_best_cache = None
+                st.cache_data.clear()
+                st.rerun()
+        # 自動觸發
+        st.session_state.m100_last_scan  = None
+        st.session_state.m100_best_cache = None
+        st.cache_data.clear()
+        st.rerun()
+    else:
+        # JS倒計時：純前端，畫面不閃
+        _scan_rm = _scan_remain // 60
+        _scan_rs = _scan_remain % 60
+        st.markdown(
+            f'<div style="background:#060a06;border:1px solid #1a2a1a;'
+            f'border-radius:10px;padding:8px 14px;margin-top:10px;" id="m100_timer_wrap">'
+            f'<div style="display:flex;align-items:center;gap:10px;">'
+            f'<span style="color:#336633;font-size:0.68rem;">🔄 下次掃描</span>'
+            f'<div style="flex:1;background:#0a100a;border-radius:3px;height:4px;">'
+            f'<div id="m100_prog" style="width:{min(100,int(_scan_elapsed/300*100))}%;'
+            f'height:4px;border-radius:3px;background:#224422;'
+            f'transition:width 1s linear;"></div></div>'
+            f'<span id="m100_countdown" style="color:#44aa44;font-weight:700;'
+            f'font-size:0.78rem;font-family:monospace;">'
+            f'{_scan_rm:02d}:{_scan_rs:02d}</span>'
+            f'</div></div>'
+            f'<script>'
+            f'(function(){{'
+            f'  var rem = {_scan_remain};'
+            f'  var total = 300;'
+            f'  var el = document.getElementById("m100_countdown");'
+            f'  var bar = document.getElementById("m100_prog");'
+            f'  if(!el) return;'
+            f'  var iv = setInterval(function(){{'
+            f'    rem--;'
+            f'    if(rem <= 0){{ clearInterval(iv); window.location.reload(); return; }}'
+            f'    var m = Math.floor(rem/60).toString().padStart(2,"0");'
+            f'    var s = (rem%60).toString().padStart(2,"0");'
+            f'    el.innerText = m+":"+s;'
+            f'    if(bar) bar.style.width = Math.min(100,Math.round((total-rem)/total*100))+"%";'
+            f'  }}, 1000);'
+            f'}})();'
+            f'</script>',
+            unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -10496,9 +10531,6 @@ st.markdown("---")
 # 💰 模式分支
 if st.session_state.m100_mode:
     render_make_100_mode(symbols)
-    # 每秒 rerun 驅動倒計時；到時間由 render_make_100_mode 內部重置並重掃
-    time.sleep(1)
-    st.rerun()
     st.stop()
 
 
