@@ -10075,62 +10075,65 @@ def render_make_100_mode(symbols: list):
     _js_locked    = "true" if _locked else "false"
     _js_next_sec  = _next_sec
 
-    st.markdown(
-        f'<div style="background:#060e06;border:2px solid #004422;'
-        f'border-radius:18px;padding:20px 26px;margin-bottom:20px;">'
+    import streamlit.components.v1 as _components
 
-        f'<div style="display:flex;align-items:center;gap:16px;margin-bottom:14px;">'
-        f'<span style="font-size:2rem;">💰</span>'
-        f'<div>'
-        f'<div style="color:#00ee66;font-weight:900;font-size:1.5rem;">今天賺 $100</div>'
-        # JS 即時倒計時標籤
-        f'<div id="m100_status" style="font-size:0.72rem;font-weight:600;">🔍 掃描中...</div>'
-        f'</div>'
-        f'<div style="margin-left:auto;text-align:right;">'
-        f'<div style="color:{prog_col};font-weight:900;font-size:1.8rem;">${earned:.0f}</div>'
-        f'<div style="color:#334433;font-size:0.7rem;">今日已賺 / 目標 $100</div>'
-        f'</div></div>'
+    _banner_html = f'''
+<div style="background:#060e06;border:2px solid #004422;
+border-radius:18px;padding:20px 26px;margin-bottom:4px;font-family:sans-serif;">
 
-        # 進度條
-        f'<div style="background:#0a1408;border-radius:8px;height:10px;overflow:hidden;">'
-        f'<div style="width:{prog_pct}%;height:10px;border-radius:8px;'
-        f'background:linear-gradient(90deg,#006633,{prog_col});'
-        f'transition:width 0.5s;"></div></div>'
-        f'<div style="display:flex;justify-content:space-between;'
-        f'font-size:0.65rem;color:#336633;margin-top:4px;">'
-        f'<span>$0</span><span style="color:{prog_col};">${earned:.0f} ({prog_pct}%)</span>'
-        f'<span>$100</span></div>'
-        f'</div>'
+  <div style="display:flex;align-items:center;gap:16px;margin-bottom:14px;">
+    <span style="font-size:2rem;">💰</span>
+    <div>
+      <div style="color:#00ee66;font-weight:900;font-size:1.5rem;">今天賺 $100</div>
+      <div id="m100_status" style="font-size:0.78rem;font-weight:600;color:#ffcc44;">🔍 載入中...</div>
+    </div>
+    <div style="margin-left:auto;text-align:right;">
+      <div style="color:{prog_col};font-weight:900;font-size:1.8rem;">${earned:.0f}</div>
+      <div style="color:#334433;font-size:0.7rem;">今日已賺 / 目標 $100</div>
+    </div>
+  </div>
 
-        # JS 倒計時腳本
-        f'''<script>
+  <div style="background:#0a1408;border-radius:8px;height:10px;overflow:hidden;">
+    <div style="width:{prog_pct}%;height:10px;border-radius:8px;
+    background:linear-gradient(90deg,#006633,{prog_col});"></div>
+  </div>
+  <div style="display:flex;justify-content:space-between;
+  font-size:0.65rem;color:#336633;margin-top:4px;">
+    <span>$0</span>
+    <span style="color:{prog_col};">${earned:.0f} ({prog_pct}%)</span>
+    <span>$100</span>
+  </div>
+</div>
+
+<script>
 (function() {{
-  var locked   = {_js_locked};
-  var secs     = {_js_next_sec};
-  var el       = document.getElementById("m100_status");
+  var locked  = {_js_locked};
+  var secs    = {_js_next_sec};
+  var el      = document.getElementById("m100_status");
   if (!el) return;
 
-  function update() {{
+  function tick() {{
     if (locked) {{
       el.style.color = "#44aaff";
       el.innerText   = "🔒 已鎖定機會，等待你進場";
       return;
     }}
     if (secs <= 0) {{
-      el.style.color = "#ffcc44";
+      el.style.color = "#aaffaa";
       el.innerText   = "🔍 掃描中...";
       return;
     }}
-    var col = secs <= 10 ? "#ff8844" : "#ffcc44";
+    var col = secs <= 10 ? "#ff8844" : secs <= 30 ? "#ffcc44" : "#88cc88";
     el.style.color = col;
     el.innerText   = "🔄 " + secs + " 秒後更新掃描";
     secs--;
-    setTimeout(update, 1000);
+    setTimeout(tick, 1000);
   }}
-  update();
+  tick();
 }})();
-</script>''',
-        unsafe_allow_html=True)
+</script>
+'''
+    _components.html(_banner_html, height=130)
 
     # ── 已達成 ───────────────────────────────────────────────────────────
     if st.session_state.m100_trade_done and earned >= TARGET:
@@ -10469,7 +10472,42 @@ st.markdown("---")
 # 💰 模式分支
 if st.session_state.m100_mode:
     render_make_100_mode(symbols)
-    st.stop()   # 不顯示其他內容，保持簡潔
+
+    # ── 5分鐘自動重新掃描（倒計時顯示）─────────────────────────────────
+    M100_REFRESH_SEC = 300   # 5分鐘
+
+    if "m100_last_scan" not in st.session_state:
+        st.session_state.m100_last_scan = time.time()
+
+    _elapsed  = int(time.time() - st.session_state.m100_last_scan)
+    _remain   = max(0, M100_REFRESH_SEC - _elapsed)
+    _remain_m = _remain // 60
+    _remain_s = _remain % 60
+    _prog_pct = int((_elapsed / M100_REFRESH_SEC) * 100)
+
+    st.markdown(
+        f'<div style="background:#060a06;border:1px solid #1a2a1a;'
+        f'border-radius:10px;padding:10px 16px;margin-top:12px;">'
+        f'<div style="display:flex;align-items:center;gap:12px;">'
+        f'<span style="color:#336633;font-size:0.72rem;">🔄 下次掃描</span>'
+        f'<div style="flex:1;background:#0a100a;border-radius:4px;height:5px;">'
+        f'<div style="width:{_prog_pct}%;height:5px;border-radius:4px;'
+        f'background:#224422;"></div></div>'
+        f'<span style="color:#44aa44;font-weight:700;font-size:0.8rem;'
+        f'font-family:monospace;">{_remain_m:02d}:{_remain_s:02d}</span>'
+        f'</div></div>',
+        unsafe_allow_html=True)
+
+    # 到時間 → 清快取重新掃描
+    if _remain <= 0:
+        st.session_state.m100_last_scan = time.time()
+        st.cache_data.clear()
+        st.rerun()
+    else:
+        time.sleep(1)
+        st.rerun()
+
+    st.stop()
 
 
 
