@@ -10037,8 +10037,25 @@ def render_make_100_mode(symbols: list):
     if "m100_earned"     not in st.session_state: st.session_state.m100_earned     = 0.0
     if "m100_trade_done" not in st.session_state: st.session_state.m100_trade_done = False
     if "m100_trade"      not in st.session_state: st.session_state.m100_trade      = None
+    if "m100_last_scan"  not in st.session_state: st.session_state.m100_last_scan  = None
+    if "m100_locked"     not in st.session_state: st.session_state.m100_locked     = False  # 找到後鎖定
+    if "m100_best_cache" not in st.session_state: st.session_state.m100_best_cache = None
 
+    SCAN_INTERVAL = 60   # 每60秒掃描一次
     TARGET = 100.0
+
+    # ── 判斷是否需要重新掃描 ─────────────────────────────────────────────
+    _now_ts    = datetime.now()
+    _last_scan = st.session_state.m100_last_scan
+    _locked    = st.session_state.m100_locked
+    _need_scan = (
+        not _locked and (                         # 未鎖定才掃描
+        _last_scan is None or
+        (_now_ts - _last_scan).total_seconds() >= SCAN_INTERVAL)
+    )
+    if _need_scan:
+        st.session_state.m100_last_scan  = _now_ts
+        st.session_state.m100_best_cache = None   # 清除快取，強制重掃
 
     # ── 頂部橫幅 ─────────────────────────────────────────────────────────
     earned    = st.session_state.m100_earned
@@ -10046,6 +10063,18 @@ def render_make_100_mode(symbols: list):
     progress  = min(1.0, earned / TARGET)
     prog_pct  = int(progress * 100)
     prog_col  = "#00ff88" if prog_pct >= 100 else "#ffcc44" if prog_pct >= 50 else "#44aaff"
+
+    # 倒計時計算
+    _last_scan = st.session_state.m100_last_scan
+    if _last_scan:
+        _elapsed  = (_now_ts - _last_scan).total_seconds()
+        _next_sec = max(0, int(SCAN_INTERVAL - _elapsed))
+        _scan_label = (f"🔒 已鎖定機會" if _locked
+                       else f"🔄 {_next_sec}秒後更新" if _next_sec > 0
+                       else "🔍 掃描中...")
+        _scan_color = "#44aaff" if _locked else "#ffcc44" if _next_sec > 10 else "#ff8844"
+    else:
+        _scan_label = "🔍 首次掃描中..."; _scan_color = "#ffcc44"
 
     st.markdown(
         f'<div style="background:#060e06;border:2px solid #004422;'
@@ -10055,7 +10084,7 @@ def render_make_100_mode(symbols: list):
         f'<span style="font-size:2rem;">💰</span>'
         f'<div>'
         f'<div style="color:#00ee66;font-weight:900;font-size:1.5rem;">今天賺 $100</div>'
-        f'<div style="color:#336633;font-size:0.72rem;">系統已為你找出今日最佳一筆交易</div>'
+        f'<div style="color:{_scan_color};font-size:0.72rem;">{_scan_label}</div>'
         f'</div>'
         f'<div style="margin-left:auto;text-align:right;">'
         f'<div style="color:{prog_col};font-weight:900;font-size:1.8rem;">${earned:.0f}</div>'
@@ -10102,12 +10131,17 @@ def render_make_100_mode(symbols: list):
 
     acct = st.session_state.m100_account
 
-    # ── 掃描最佳機會 ─────────────────────────────────────────────────────
-    with st.spinner("🔍 掃描今日最佳機會..."):
-        best = None
-        best_score = -999
+    # ── 掃描最佳機會（使用快取，60秒重掃一次）──────────────────────────
+    if st.session_state.m100_best_cache and not _need_scan:
+        best = st.session_state.m100_best_cache
+    else:
+        with st.spinner("🔍 掃描今日最佳機會..."):
+            best = None
+            best_score = -999
+            _skip = st.session_state.get("m100_skip_list", set())
 
         for sym in symbols:
+            if sym in _skip: continue
             try:
                 _df = fetch_data(sym, "5m")
                 if _df is None or _df.empty or len(_df) < 20:
@@ -10200,6 +10234,9 @@ def render_make_100_mode(symbols: list):
                     }
             except Exception:
                 continue
+
+        # 存入快取
+        st.session_state.m100_best_cache = best
 
     # ── 顯示最佳機會 ─────────────────────────────────────────────────────
     if not best:
@@ -10315,8 +10352,9 @@ def render_make_100_mode(symbols: list):
     with col_ok:
         if st.button("✅ 我知道了，準備進場", key="m100_confirm",
                      use_container_width=True):
-            st.session_state.m100_trade = best
-            st.toast(f"✅ 已記錄：{best['sym']} {di}，目標 +${best['profit']:.0f}")
+            st.session_state.m100_trade  = best
+            st.session_state.m100_locked = True   # 鎖定，不再重新掃描
+            st.toast(f"✅ 已鎖定：{best['sym']} {'做多' if best['dir']=='LONG' else '做空'}，目標 +${best['profit']:.0f}")
 
     with col_skip:
         if st.button("⏭ 跳過，找下一個", key="m100_skip",
@@ -10325,6 +10363,8 @@ def render_make_100_mode(symbols: list):
             if "m100_skip_list" not in st.session_state:
                 st.session_state.m100_skip_list = set()
             st.session_state.m100_skip_list.add(best["sym"])
+            st.session_state.m100_locked     = False   # 解鎖重新掃描
+            st.session_state.m100_best_cache = None
             st.rerun()
 
     with col_win:
